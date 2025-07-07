@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: fastapi-crawler
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PORT
+        value: "8000"
