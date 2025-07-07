@@ -490,7 +490,7 @@ async def get_tax_info_api(keyword: str = Query(..., min_length=1, description="
             await page.wait_for_load_state('domcontentloaded')
             
             # Đợi input search xuất hiện
-            await page.wait_for_selector('input[name="q"]', timeout=10000)
+            await page.wait_for_selector('input[name="q"]', timeout=60000)
             
             # Nhập keyword và tìm kiếm
             await page.fill('input[name="q"]', keyword)
@@ -500,7 +500,7 @@ async def get_tax_info_api(keyword: str = Query(..., min_length=1, description="
             await page.wait_for_load_state('domcontentloaded')
             
             # Đợi bảng kết quả tải xong
-            await page.wait_for_selector('table.table-taxinfo tbody', timeout=10000)
+            await page.wait_for_selector('table.table-taxinfo tbody', timeout=60000)
             
             # Trích xuất dữ liệu
             result = await page.evaluate("""
@@ -668,7 +668,7 @@ async def get_tax_info_internal(keyword: str):
             await page.wait_for_load_state('domcontentloaded')
             
             # Đợi input search xuất hiện
-            await page.wait_for_selector('input[name="q"]', timeout=10000)
+            await page.wait_for_selector('input[name="q"]', timeout=60000)
             
             # Nhập keyword và tìm kiếm
             await page.fill('input[name="q"]', keyword)
@@ -678,7 +678,7 @@ async def get_tax_info_internal(keyword: str):
             await page.wait_for_load_state('domcontentloaded')
             
             # Đợi bảng kết quả tải xong
-            await page.wait_for_selector('table.table-taxinfo tbody', timeout=10000)
+            await page.wait_for_selector('table.table-taxinfo tbody', timeout=60000)
             
             # Trích xuất dữ liệu
             result = await page.evaluate("""
