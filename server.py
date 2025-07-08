@@ -705,12 +705,26 @@ async def get_combined_info_api(keyword: str = Query(..., min_length=1, descript
 async def get_tax_info_internal(keyword: str, max_retries: int = 3):
     """Enhanced tax info function with better error handling"""
     browser = None
-    
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"Tax info attempt {attempt + 1}/{max_retries} for keyword: {keyword}")
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+    headless=True,  # Bắt buộc phải là True trên server
+    args=[
+        '--no-sandbox',
+        '--disable-setuid-sandbox', 
+        '--disable-dev-shm-usage',
+        '--disable-extensions',
+        '--disable-plugins',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-features=TranslateUI',
+        '--disable-ipc-flooding-protection',
+        '--single-process'  # Quan trọng cho môi trường container
+    ]
+)
             
-<<<<<<< HEAD
             context = await browser.new_context(
                 viewport={'width': 1280, 'height': 800},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114 Safari/537.36'
@@ -728,7 +742,7 @@ async def get_tax_info_internal(keyword: str, max_retries: int = 3):
             await page.wait_for_load_state('domcontentloaded')
             
             # Đợi input search xuất hiện
-            await page.wait_for_selector('input[name="q"]', timeout=60000)
+            await page.wait_for_selector('input[name="q"]', timeout=10000)
             
             # Nhập keyword và tìm kiếm
             await page.fill('input[name="q"]', keyword)
@@ -738,7 +752,7 @@ async def get_tax_info_internal(keyword: str, max_retries: int = 3):
             await page.wait_for_load_state('domcontentloaded')
             
             # Đợi bảng kết quả tải xong
-            await page.wait_for_selector('table.table-taxinfo tbody', timeout=60000)
+            await page.wait_for_selector('table.table-taxinfo tbody', timeout=10000)
             
             # Trích xuất dữ liệu
             result = await page.evaluate("""
@@ -758,140 +772,55 @@ async def get_tax_info_internal(keyword: str, max_retries: int = 3):
                         const label = row.querySelector('td:first-child')?.innerText.trim();
                         const valueCell = row.querySelector('td:nth-child(2)');
                         if (!label || !valueCell) return;
-=======
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-extensions',
-                        '--disable-plugins',
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-background-timer-throttling',
-                        '--disable-backgrounding-occluded-windows',
-                        '--disable-renderer-backgrounding',
-                        '--disable-features=TranslateUI',
-                        '--disable-ipc-flooding-protection',
-                        '--single-process',
-                        '--disable-gpu'
-                    ]
-                )
-                
-                context = await browser.new_context(
-                    viewport={'width': 1280, 'height': 800},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    timeout=90000  # 1.5 phút
-                )
-                
-                page = await context.new_page()
-                page.set_default_timeout(90000)
-                
-                # Block unnecessary resources
-                await page.route("**/*", lambda route: route.abort() 
-                    if route.request.resource_type in ["image", "font", "media"] 
-                    else route.continue_())
-                
-                logger.info(f"Navigating to masothue.com for keyword: {keyword}")
-                
-                # Navigate with retry
-                for nav_attempt in range(3):
-                    try:
-                        await page.goto('https://masothue.com', timeout=90000, wait_until='domcontentloaded')
-                        logger.info("Successfully navigated to masothue.com")
-                        break
-                    except Exception as nav_error:
-                        logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
-                        if nav_attempt == 2:
-                            raise nav_error
-                        await asyncio.sleep(2)
-                
-                # Wait for search input
-                await page.wait_for_selector('input[name="q"]', timeout=30000)
-                
-                # Fill and submit search
-                await page.fill('input[name="q"]', keyword)
-                await page.click('.btn-search-submit')
-                
-                # Wait for results
-                await page.wait_for_load_state('domcontentloaded')
-                await page.wait_for_selector('table.table-taxinfo tbody', timeout=45000)
-                
-                # Extract data
-                result = await page.evaluate("""
-                    () => {
-                        const result = {};
->>>>>>> a3b6519 (update)
                         
-                        // Get company name from header
-                        const companyNameHeader = document.querySelector('table.table-taxinfo thead th[itemprop="name"] .copy');
-                        if (companyNameHeader) {
-                            result.companyName = companyNameHeader.getAttribute('title') || companyNameHeader.innerText.trim();
+                        let value = valueCell.innerText.trim();
+                        
+                        // Xử lý trường hợp người đại diện - lấy tên từ thẻ a hoặc span
+                        if (label.includes('Người đại diện')) {
+                            const nameElement = valueCell.querySelector('[itemprop="name"]');
+                            if (nameElement) {
+                                value = nameElement.innerText.trim();
+                            }
                         }
                         
-                        // Get information from tbody
-                        const rows = Array.from(document.querySelectorAll('table.table-taxinfo tbody tr'));
-                        
-                        rows.forEach(row => {
-                            const label = row.querySelector('td:first-child')?.innerText.trim();
-                            const valueCell = row.querySelector('td:nth-child(2)');
-                            if (!label || !valueCell) return;
-                            
-                            let value = valueCell.innerText.trim();
-                            
-                            // Handle legal representative - get name from a or span tag
-                            if (label.includes('Người đại diện')) {
-                                const nameElement = valueCell.querySelector('[itemprop="name"]');
-                                if (nameElement) {
-                                    value = nameElement.innerText.trim();
-                                }
-                            }
-                            
-                            // Map only necessary fields
-                            if (label.includes('Mã số thuế')) {
-                                result.taxID = value;
-                            } else if (label.includes('Địa chỉ')) {
-                                result.address = value;
-                            } else if (label.includes('Người đại diện')) {
-                                result.legalRepresentative = value;
-                            } else if (label.includes('Ngày hoạt động')) {
-                                result.startDate = value;
-                            } else if (label.includes('Tình trạng')) {
-                                result.status = value;
-                            } else if (label.includes('Loại hình DN')) {
-                                result.companyType = value;
-                            }
-                        });
-                        
-                        return result;
-                    }
-                """)
-                
-                logger.info(f"Successfully scraped tax info for keyword: {keyword}")
-                
-                return {
-                    "keyword": keyword,
-                    "data": result,
-                    "status": "success"
+                        // Mapping chỉ các trường cần thiết
+                        if (label.includes('Mã số thuế')) {
+                            result.taxID = value;
+                        } else if (label.includes('Địa chỉ')) {
+                            result.address = value;
+                        } else if (label.includes('Người đại diện')) {
+                            result.legalRepresentative = value;
+                        } else if (label.includes('Ngày hoạt động')) {
+                            result.startDate = value;
+                        } else if (label.includes('Tình trạng')) {
+                            result.status = value;
+                        } else if (label.includes('Loại hình DN')) {
+                            result.companyType = value;
+                        }
+                    });
+                    
+                    return result;
                 }
-                
-        except Exception as e:
-            logger.error(f"Tax info attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:
-                raise Exception(f"All {max_retries} attempts failed. Last error: {e}")
+            """)
             
-            # Wait before retry
-            wait_time = 2 ** attempt
-            logger.info(f"Waiting {wait_time} seconds before retry...")
-            await asyncio.sleep(wait_time)
+            logger.info(f"Successfully scraped tax info for keyword: {keyword}")
             
-        finally:
-            if browser:
-                try:
-                    await browser.close()
-                except:
-                    pass
+            return {
+                "keyword": keyword,
+                "data": result,
+                "status": "success"
+            }
+            
+    except Exception as e:
+        logger.error(f"Tax info scraping failed: {e}")
+        raise Exception(f"Failed to fetch tax info: {str(e)}")
+        
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except:
+                pass
 
 async def get_contact_info_internal(mst: str, max_retries: int = 3):
     """Enhanced contact info function with retry logic"""
