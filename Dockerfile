@@ -51,8 +51,4 @@ COPY . .
 EXPOSE 8000
 
 # Command to run
-<<<<<<< HEAD
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
-=======
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
->>>>>>> a3b6519 (update)
