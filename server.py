@@ -312,107 +312,183 @@ async def inject_captcha_response(page, captcha_code):
         logger.error(f"Injection failed: {e}")
         return False
 
-async def crawl_and_download_pdf(mst: str):
+async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
+    """Enhanced crawl function with better error handling and retries"""
     browser = None
-    try:
-        async with async_playwright() as p:
-            # Trong function crawl_and_download_pdf và get_tax_info_internal
-            browser = await p.chromium.launch(
-                headless=True,  # Bắt buộc phải là True trên server
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox', 
-                    '--disable-dev-shm-usage',
-                    '--disable-extensions',
-                    '--disable-plugins',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--disable-features=TranslateUI',
-                    '--disable-ipc-flooding-protection',
-                    '--single-process'  # Quan trọng cho môi trường container
-                ]
-            )
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempt {attempt + 1}/{max_retries} for MST: {mst}")
             
-            context = await browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            )
-            
-            page = await context.new_page()
-            
-            # Navigate to page
-            logger.info(f"Navigating to target URL for MST: {mst}")
-            await page.goto(TARGET_URL, timeout=60000)
-            await page.wait_for_load_state('networkidle')
-            
-            # Fill form
-            logger.info("Filling form...")
-            await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', 'AMEND')
-            await page.wait_for_timeout(2000)
-            await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
-            
-            # Solve captcha
-            logger.info("Solving captcha...")
-            captcha_code = await asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL)
-            logger.info("Captcha solved successfully")
-            
-            # Inject captcha response
-            success = await inject_captcha_response(page, captcha_code)
-            if not success:
-                raise Exception("Failed to inject captcha response")
-            
-            await page.wait_for_timeout(2000)
-            
-            # Submit form
-            await page.click('#ctl00_C_BtnFilter')
-            logger.info("Clicked search button")
-            
-            # Wait for page to reload and show results
-            await page.wait_for_load_state('networkidle', timeout=30000)
-            
-            # Wait for results table
-            try:
-                await page.wait_for_selector('#ctl00_C_CtlList', timeout=30000)
-                logger.info("Results table found")
-            except:
-                no_results = await page.query_selector('text=Không tìm thấy dữ liệu')
-                if no_results:
-                    logger.info("No results found for this MST")
+            async with async_playwright() as p:
+                # Optimized browser configuration for production
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-extensions',
+                        '--disable-plugins',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-features=TranslateUI',
+                        '--disable-ipc-flooding-protection',
+                        '--single-process',
+                        '--disable-gpu',
+                        '--disable-software-rasterizer',
+                        '--disable-web-security',
+                        '--disable-features=site-per-process',
+                        '--memory-pressure-off',
+                        '--max_old_space_size=4096'
+                    ]
+                )
+                
+                context = await browser.new_context(
+                    viewport={'width': 1366, 'height': 768},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    # Tăng timeout cho từng request
+                    timeout=120000,  # 2 phút
+                    # Giảm resource usage
+                    ignore_https_errors=True,
+                    java_script_enabled=True
+                )
+                
+                # Block unnecessary resources to speed up
+                await context.route("**/*", lambda route: route.abort() 
+                    if route.request.resource_type in ["image", "font", "media", "stylesheet"] 
+                    else route.continue_())
+                
+                page = await context.new_page()
+                
+                # Set longer timeout for navigation
+                page.set_default_timeout(120000)  # 2 phút
+                
+                # Navigate with retry logic
+                logger.info(f"Navigating to target URL for MST: {mst}")
+                
+                # Try to navigate with exponential backoff
+                for nav_attempt in range(3):
+                    try:
+                        await page.goto(TARGET_URL, timeout=120000, wait_until='domcontentloaded')
+                        logger.info("Successfully navigated to target URL")
+                        break
+                    except Exception as nav_error:
+                        logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
+                        if nav_attempt == 2:
+                            raise nav_error
+                        await asyncio.sleep(2 ** nav_attempt)  # Exponential backoff
+                
+                # Wait for page to be ready
+                await page.wait_for_load_state('domcontentloaded')
+                
+                # Wait for form elements with explicit timeout
+                try:
+                    await page.wait_for_selector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', timeout=30000)
+                    logger.info("Form elements loaded successfully")
+                except Exception as e:
+                    logger.error(f"Form elements not found: {e}")
+                    raise Exception("Form elements not loaded")
+                
+                # Fill form with delays
+                logger.info("Filling form...")
+                await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', 'AMEND')
+                await page.wait_for_timeout(3000)  # Tăng delay
+                await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
+                await page.wait_for_timeout(2000)
+                
+                # Solve captcha with retry
+                logger.info("Solving captcha...")
+                captcha_code = None
+                for captcha_attempt in range(2):
+                    try:
+                        captcha_code = await asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL)
+                        logger.info("Captcha solved successfully")
+                        break
+                    except Exception as captcha_error:
+                        logger.warning(f"Captcha attempt {captcha_attempt + 1} failed: {captcha_error}")
+                        if captcha_attempt == 1:
+                            raise captcha_error
+                        await asyncio.sleep(5)
+                
+                if not captcha_code:
+                    raise Exception("Failed to solve captcha")
+                
+                # Inject captcha response
+                success = await inject_captcha_response(page, captcha_code)
+                if not success:
+                    raise Exception("Failed to inject captcha response")
+                
+                await page.wait_for_timeout(3000)
+                
+                # Submit form
+                logger.info("Submitting form...")
+                await page.click('#ctl00_C_BtnFilter')
+                
+                # Wait for results with longer timeout
+                await page.wait_for_load_state('domcontentloaded', timeout=60000)
+                
+                # Check for results
+                try:
+                    await page.wait_for_selector('#ctl00_C_CtlList', timeout=45000)
+                    logger.info("Results table found")
+                except Exception:
+                    # Check if no results message appears
+                    try:
+                        no_results = await page.wait_for_selector('text=Không tìm thấy dữ liệu', timeout=10000)
+                        if no_results:
+                            logger.info("No results found for this MST")
+                            return None
+                    except:
+                        pass
+                    
+                    logger.error("Results table not found within timeout")
+                    raise Exception("Results table not found")
+                
+                # Find and click PDF button
+                pdf_button = await page.query_selector('input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]')
+                if not pdf_button:
+                    logger.info("No PDF button found - no results available")
                     return None
-                raise Exception("Results table not found")
+                
+                # Download PDF
+                file_name = f"{mst}_{uuid.uuid4().hex[:8]}.pdf"
+                download_path = os.path.join(os.getcwd(), file_name)
+                
+                # Setup download handler with timeout
+                try:
+                    async with page.expect_download(timeout=60000) as download_info:
+                        await pdf_button.click()
+                        logger.info("Clicked PDF download button")
+                    
+                    download = await download_info.value
+                    await download.save_as(download_path)
+                    logger.info(f"PDF downloaded successfully: {file_name}")
+                    
+                    return file_name
+                    
+                except Exception as download_error:
+                    logger.error(f"Download failed: {download_error}")
+                    raise Exception(f"PDF download failed: {download_error}")
+                
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                raise Exception(f"All {max_retries} attempts failed. Last error: {e}")
             
-            # Find PDF button
-            pdf_button = await page.query_selector('input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]')
-            if not pdf_button:
-                logger.info("No PDF button found - no results available")
-                return None
+            # Wait before retry with exponential backoff
+            wait_time = 2 ** attempt
+            logger.info(f"Waiting {wait_time} seconds before retry...")
+            await asyncio.sleep(wait_time)
             
-            # Download PDF
-            file_name = f"{mst}_{uuid.uuid4().hex[:8]}.pdf"
-            download_path = os.path.join(os.getcwd(), file_name)
-            
-            # Setup download handler
-            async with page.expect_download() as download_info:
-                await pdf_button.click()
-                logger.info("Clicked PDF download button")
-            
-            download = await download_info.value
-            await download.save_as(download_path)
-            logger.info(f"PDF downloaded: {file_name}")
-            
-            return file_name
-            
-    except Exception as e:
-        logger.error(f"Crawl failed: {e}")
-        raise
-    finally:
-        if browser:
-            try:
-                await browser.close()
-            except:
-                pass
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except:
+                    pass
 
 @app.get("/get-contact-info")
 async def get_contact_info_api(mst: str = Query(..., min_length=10, max_length=14)):
@@ -573,13 +649,13 @@ async def get_tax_info_api(keyword: str = Query(..., min_length=1, description="
 @app.get("/combined-info")
 async def get_combined_info_api(keyword: str = Query(..., min_length=1, description="Keyword to search for tax information")):
     """
-    API endpoint để lấy thông tin thuế trước, sau đó lấy thông tin liên hệ và ghép lại
+    Enhanced API endpoint với better error handling và retry logic
     """
     try:
-        # Step 1: Lấy thông tin thuế trước
+        # Step 1: Get tax info with retry
         logger.info(f"Step 1: Getting tax info for keyword: {keyword}")
         
-        tax_info = await get_tax_info_internal(keyword)
+        tax_info = await get_tax_info_internal(keyword, max_retries=3)
         
         if not tax_info or not tax_info.get('data'):
             return JSONResponse({
@@ -587,7 +663,7 @@ async def get_combined_info_api(keyword: str = Query(..., min_length=1, descript
                 "keyword": keyword
             }, status_code=404)
         
-        # Lấy MST từ tax_info
+        # Get MST from tax_info
         mst = tax_info['data'].get('taxID')
         if not mst:
             return JSONResponse({
@@ -598,12 +674,12 @@ async def get_combined_info_api(keyword: str = Query(..., min_length=1, descript
         
         logger.info(f"Found MST: {mst}")
         
-        # Step 2: Lấy thông tin liên hệ
+        # Step 2: Get contact info with retry
         logger.info(f"Step 2: Getting contact info for MST: {mst}")
         
-        contact_info = await get_contact_info_internal(mst)
+        contact_info = await get_contact_info_internal(mst, max_retries=3)
         
-        # Step 3: Ghép kết quả
+        # Step 3: Combine results
         combined_result = {
             "keyword": keyword,
             "tax_info": tax_info['data'],
@@ -625,32 +701,16 @@ async def get_combined_info_api(keyword: str = Query(..., min_length=1, descript
             "error": f"Failed to get combined information: {str(e)}",
             "keyword": keyword
         }, status_code=500)
-
-async def get_tax_info_internal(keyword: str):
-    """
-    Internal function để lấy thông tin thuế (tương tự như API /tax-info)
-    """
+    
+async def get_tax_info_internal(keyword: str, max_retries: int = 3):
+    """Enhanced tax info function with better error handling"""
     browser = None
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-    headless=True,  # Bắt buộc phải là True trên server
-    args=[
-        '--no-sandbox',
-        '--disable-setuid-sandbox', 
-        '--disable-dev-shm-usage',
-        '--disable-extensions',
-        '--disable-plugins',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--disable-features=TranslateUI',
-        '--disable-ipc-flooding-protection',
-        '--single-process'  # Quan trọng cho môi trường container
-    ]
-)
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Tax info attempt {attempt + 1}/{max_retries} for keyword: {keyword}")
             
+<<<<<<< HEAD
             context = await browser.new_context(
                 viewport={'width': 1280, 'height': 800},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114 Safari/537.36'
@@ -698,97 +758,190 @@ async def get_tax_info_internal(keyword: str):
                         const label = row.querySelector('td:first-child')?.innerText.trim();
                         const valueCell = row.querySelector('td:nth-child(2)');
                         if (!label || !valueCell) return;
+=======
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-extensions',
+                        '--disable-plugins',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-features=TranslateUI',
+                        '--disable-ipc-flooding-protection',
+                        '--single-process',
+                        '--disable-gpu'
+                    ]
+                )
+                
+                context = await browser.new_context(
+                    viewport={'width': 1280, 'height': 800},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    timeout=90000  # 1.5 phút
+                )
+                
+                page = await context.new_page()
+                page.set_default_timeout(90000)
+                
+                # Block unnecessary resources
+                await page.route("**/*", lambda route: route.abort() 
+                    if route.request.resource_type in ["image", "font", "media"] 
+                    else route.continue_())
+                
+                logger.info(f"Navigating to masothue.com for keyword: {keyword}")
+                
+                # Navigate with retry
+                for nav_attempt in range(3):
+                    try:
+                        await page.goto('https://masothue.com', timeout=90000, wait_until='domcontentloaded')
+                        logger.info("Successfully navigated to masothue.com")
+                        break
+                    except Exception as nav_error:
+                        logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
+                        if nav_attempt == 2:
+                            raise nav_error
+                        await asyncio.sleep(2)
+                
+                # Wait for search input
+                await page.wait_for_selector('input[name="q"]', timeout=30000)
+                
+                # Fill and submit search
+                await page.fill('input[name="q"]', keyword)
+                await page.click('.btn-search-submit')
+                
+                # Wait for results
+                await page.wait_for_load_state('domcontentloaded')
+                await page.wait_for_selector('table.table-taxinfo tbody', timeout=45000)
+                
+                # Extract data
+                result = await page.evaluate("""
+                    () => {
+                        const result = {};
+>>>>>>> a3b6519 (update)
                         
-                        let value = valueCell.innerText.trim();
+                        // Get company name from header
+                        const companyNameHeader = document.querySelector('table.table-taxinfo thead th[itemprop="name"] .copy');
+                        if (companyNameHeader) {
+                            result.companyName = companyNameHeader.getAttribute('title') || companyNameHeader.innerText.trim();
+                        }
                         
-                        // Xử lý trường hợp người đại diện - lấy tên từ thẻ a hoặc span
-                        if (label.includes('Người đại diện')) {
-                            const nameElement = valueCell.querySelector('[itemprop="name"]');
-                            if (nameElement) {
-                                value = nameElement.innerText.trim();
+                        // Get information from tbody
+                        const rows = Array.from(document.querySelectorAll('table.table-taxinfo tbody tr'));
+                        
+                        rows.forEach(row => {
+                            const label = row.querySelector('td:first-child')?.innerText.trim();
+                            const valueCell = row.querySelector('td:nth-child(2)');
+                            if (!label || !valueCell) return;
+                            
+                            let value = valueCell.innerText.trim();
+                            
+                            // Handle legal representative - get name from a or span tag
+                            if (label.includes('Người đại diện')) {
+                                const nameElement = valueCell.querySelector('[itemprop="name"]');
+                                if (nameElement) {
+                                    value = nameElement.innerText.trim();
+                                }
                             }
-                        }
+                            
+                            // Map only necessary fields
+                            if (label.includes('Mã số thuế')) {
+                                result.taxID = value;
+                            } else if (label.includes('Địa chỉ')) {
+                                result.address = value;
+                            } else if (label.includes('Người đại diện')) {
+                                result.legalRepresentative = value;
+                            } else if (label.includes('Ngày hoạt động')) {
+                                result.startDate = value;
+                            } else if (label.includes('Tình trạng')) {
+                                result.status = value;
+                            } else if (label.includes('Loại hình DN')) {
+                                result.companyType = value;
+                            }
+                        });
                         
-                        // Mapping chỉ các trường cần thiết
-                        if (label.includes('Mã số thuế')) {
-                            result.taxID = value;
-                        } else if (label.includes('Địa chỉ')) {
-                            result.address = value;
-                        } else if (label.includes('Người đại diện')) {
-                            result.legalRepresentative = value;
-                        } else if (label.includes('Ngày hoạt động')) {
-                            result.startDate = value;
-                        } else if (label.includes('Tình trạng')) {
-                            result.status = value;
-                        } else if (label.includes('Loại hình DN')) {
-                            result.companyType = value;
-                        }
-                    });
-                    
-                    return result;
+                        return result;
+                    }
+                """)
+                
+                logger.info(f"Successfully scraped tax info for keyword: {keyword}")
+                
+                return {
+                    "keyword": keyword,
+                    "data": result,
+                    "status": "success"
                 }
-            """)
+                
+        except Exception as e:
+            logger.error(f"Tax info attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                raise Exception(f"All {max_retries} attempts failed. Last error: {e}")
             
-            logger.info(f"Successfully scraped tax info for keyword: {keyword}")
+            # Wait before retry
+            wait_time = 2 ** attempt
+            logger.info(f"Waiting {wait_time} seconds before retry...")
+            await asyncio.sleep(wait_time)
             
-            return {
-                "keyword": keyword,
-                "data": result,
-                "status": "success"
-            }
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except:
+                    pass
+
+async def get_contact_info_internal(mst: str, max_retries: int = 3):
+    """Enhanced contact info function with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Contact info attempt {attempt + 1}/{max_retries} for MST: {mst}")
             
-    except Exception as e:
-        logger.error(f"Tax info scraping failed: {e}")
-        raise Exception(f"Failed to fetch tax info: {str(e)}")
-        
-    finally:
-        if browser:
+            # Check balance
+            balance = await asyncio.to_thread(solver.get_balance)
+            if balance < 0.001:
+                logger.warning("Insufficient balance for captcha solving")
+                return None
+            
+            # Crawl and download with retry
+            pdf_path = await crawl_and_download_pdf(mst, max_retries=2)
+            
+            if not pdf_path or not os.path.exists(pdf_path):
+                logger.info("No PDF found for MST")
+                return None
+            
+            # Extract contact information from PDF
+            contact_info = extract_pdf_contact_info(pdf_path)
+            
+            # Clean up PDF file
             try:
-                await browser.close()
+                os.remove(pdf_path)
+                logger.info(f"Cleaned up PDF file: {pdf_path}")
             except:
                 pass
-
-async def get_contact_info_internal(mst: str):
-    """
-    Internal function để lấy thông tin liên hệ (tương tự như API /get-contact-info)
-    """
-    try:
-        # Check balance
-        balance = await asyncio.to_thread(solver.get_balance)
-        if balance < 0.001:
-            logger.warning("Insufficient balance for captcha solving")
-            return None
-        
-        # Crawl and download
-        pdf_path = await crawl_and_download_pdf(mst)
-        
-        if not pdf_path or not os.path.exists(pdf_path):
-            logger.info("No PDF found for MST")
-            return None
-        
-        # Extract contact information from PDF
-        contact_info = extract_pdf_contact_info(pdf_path)
-        
-        # Clean up PDF file
-        try:
-            os.remove(pdf_path)
-            logger.info(f"Cleaned up PDF file: {pdf_path}")
-        except:
-            pass
-        
-        if not contact_info:
-            logger.info("No contact information found in PDF")
-            return None
-        
-        return {
-            "mst": mst,
-            "email": contact_info.get('email'),
-            "phone": contact_info.get('phone')
-        }
-        
-    except Exception as e:
-        logger.error(f"Contact info extraction failed: {e}")
-        return None
+            
+            if not contact_info:
+                logger.info("No contact information found in PDF")
+                return None
+            
+            return {
+                "mst": mst,
+                "email": contact_info.get('email'),
+                "phone": contact_info.get('phone')
+            }
+            
+        except Exception as e:
+            logger.error(f"Contact info attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                logger.error(f"All {max_retries} attempts failed for MST: {mst}")
+                return None
+            
+            # Wait before retry
+            wait_time = 2 ** attempt
+            logger.info(f"Waiting {wait_time} seconds before retry...")
+            await asyncio.sleep(wait_time)
 
 port = int(os.environ.get("PORT", 8000))
 
