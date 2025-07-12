@@ -7,6 +7,19 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     procps \
     curl \
+    unixodbc \
+    unixodbc-dev \
+    odbcinst1debian2 \
+    libodbc1 \
+    apt-transport-https \
+    lsb-release \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cài đặt Microsoft ODBC Driver 18 for SQL Server
+RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
+    && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y msodbcsql18 \
     && rm -rf /var/lib/apt/lists/*
 
 # Cài đặt Chrome dependencies

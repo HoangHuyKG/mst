@@ -545,6 +545,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                 )
                 
                 # Tạo context KHÔNG có timeout parameter
+                # Tạo context với ignore_https_errors và error handling
                 context = await browser.new_context(
                     viewport={'width': 1366, 'height': 768},
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -556,16 +557,19 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         'Upgrade-Insecure-Requests': '1'
                     },
                     ignore_https_errors=True,
-                    java_script_enabled=True
+                    java_script_enabled=True,
+                    bypass_csp=True,  # Thêm dòng này
+                    ignore_default_args=['--disable-extensions']  # Thêm dòng này
                 )
                 
                 # Set timeout cho context sau khi tạo
                 context.set_default_timeout(180000)  # 3 phút
                 
-                # Chỉ chặn media files, giữ lại CSS và JS
-                await context.route("**/*", lambda route: route.abort() 
-                    if route.request.resource_type in ["image", "media"] 
-                    else route.continue_())
+                # Chặn tài nguyên không cần thiết nhưng giữ lại CSS, JS và các tài nguyên quan trọng
+                await context.route("**/*", lambda route: (
+                    route.abort() if route.request.resource_type in ["image", "media", "font"] 
+                    else route.continue_()
+                ))
                 
                 page = await context.new_page()
                 
@@ -573,6 +577,16 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                 page.set_default_timeout(180000)  # 3 phút
                 
                 # Thêm error handlers
+                # Thêm error handlers với exception handling
+                async def handle_page_error(error):
+                    logger.error(f"Page error: {error}")
+
+                async def handle_console(msg):
+                    if msg.type == "error" and "net::ERR_FAILED" not in msg.text:
+                        logger.info(f"Console: {msg.text}")
+
+                page.on("pageerror", handle_page_error)
+                page.on("console", handle_console)
                 page.on("pageerror", lambda error: logger.error(f"Page error: {error}"))
                 page.on("console", lambda msg: logger.info(f"Console: {msg.text}"))
                 
@@ -1172,9 +1186,21 @@ async def get_tax_info_internal(keyword: str, max_retries: int = 3):
                 page.set_default_timeout(60000)
                 
                 # Chặn tài nguyên không cần thiết
-                await page.route("**/*", lambda route: route.abort() 
-                    if route.request.resource_type in ["image", "font", "media"] 
-                    else route.continue_())
+                # Chặn tài nguyên không cần thiết với exception handling
+                async def handle_route(route):
+                    try:
+                        if route.request.resource_type in ["image", "font", "media"]:
+                            await route.abort()
+                        else:
+                            await route.continue_()
+                    except Exception as e:
+                        logger.warning(f"Route handling error: {e}")
+                        try:
+                            await route.continue_()
+                        except:
+                            pass
+
+                await page.route("**/*", handle_route)
                 
                 logger.info(f"Navigating to masothue.com for keyword: {keyword}")
                 
@@ -1347,7 +1373,70 @@ async def get_contact_info_internal(mst: str, max_retries: int = 3):
             await asyncio.sleep(wait_time)
 
 port = int(os.environ.get("PORT", 8000))
-
+@app.get("/test-db")
+async def test_database_connection():
+    """
+    API endpoint để test kết nối database
+    """
+    try:
+        # Test connection
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Test query
+            cursor.execute("SELECT 1")
+            result = cursor.fetchone()
+            
+            # Get database info
+            cursor.execute("SELECT DB_NAME() as database_name")
+            db_info = cursor.fetchone()
+            
+            # Get server info
+            cursor.execute("SELECT @@VERSION as server_version")
+            server_info = cursor.fetchone()
+            
+            # Test table existence
+            cursor.execute("""
+                SELECT COUNT(*) as table_count 
+                FROM INFORMATION_SCHEMA.TABLES 
+                WHERE TABLE_NAME = 'company_info'
+            """)
+            table_exists = cursor.fetchone()[0] > 0
+            
+            # Get record count if table exists
+            record_count = 0
+            if table_exists:
+                cursor.execute("SELECT COUNT(*) FROM company_info")
+                record_count = cursor.fetchone()[0]
+            
+            return JSONResponse({
+                "status": "success",
+                "message": "Database connection successful",
+                "database_name": db_info[0] if db_info else "Unknown",
+                "server_version": server_info[0] if server_info else "Unknown",
+                "table_exists": table_exists,
+                "record_count": record_count,
+                "connection_config": {
+                    "server": SQL_SERVER_CONFIG['server'],
+                    "database": SQL_SERVER_CONFIG['database'],
+                    "username": SQL_SERVER_CONFIG['username'],
+                    "port": SQL_SERVER_CONFIG['port']
+                }
+            })
+            
+    except Exception as e:
+        logger.error(f"Database connection test failed: {e}")
+        return JSONResponse({
+            "status": "error",
+            "message": "Database connection failed",
+            "error": str(e),
+            "connection_config": {
+                "server": SQL_SERVER_CONFIG['server'],
+                "database": SQL_SERVER_CONFIG['database'],
+                "username": SQL_SERVER_CONFIG['username'],
+                "port": SQL_SERVER_CONFIG['port']
+            }
+        }, status_code=500)
 
 
 if __name__ == "__main__":
