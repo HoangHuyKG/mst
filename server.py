@@ -34,7 +34,8 @@ SQL_SERVER_CONFIG = {
     'password': os.environ.get('SQL_PASSWORD', 'your_password'),
     'driver': '{ODBC Driver 17 for SQL Server}',
     'port': int(os.environ.get('SQL_PORT', '1433')),
-    'timeout': 30,
+    'timeout': 60,  # Tăng timeout lên 60 giây
+    'login_timeout': 60,  # Thêm login timeout
     'encrypt': 'no',
     'trust_server_certificate': 'yes'
 }
@@ -126,25 +127,149 @@ class CaptchaSolver:
 class DatabaseManager:
     def __init__(self, config):
         self.config = config
-        self.connection_string = (
-            f"DRIVER={config['driver']};"
-            f"SERVER={config['server']},{config['port']};"
-            f"DATABASE={config['database']};"
-            f"UID={config['username']};"
-            f"PWD={config['password']};"
-            f"Encrypt=yes;"
+        self.max_retries = 3
+        self.retry_delay = 5  # giây
+        
+    def _build_connection_string(self):
+        """Xây dựng connection string với nhiều tùy chọn"""
+        # Thử connection string đầy đủ
+        connection_string = (
+            f"DRIVER={self.config['driver']};"
+            f"SERVER={self.config['server']},{self.config['port']};"
+            f"DATABASE={self.config['database']};"
+            f"UID={self.config['username']};"
+            f"PWD={self.config['password']};"
+            f"Encrypt=no;"
             f"TrustServerCertificate=yes;"
-            f"Connection Timeout={config['timeout']};"
+            f"Connection Timeout={self.config['timeout']};"
+            f"Login Timeout={self.config.get('login_timeout', 60)};"
+            f"MultipleActiveResultSets=True;"
+            f"ApplicationIntent=ReadWrite;"
         )
+        return connection_string
+    
+    def _test_connection(self):
+        """Test kết nối với server"""
+        import socket
+        try:
+            # Test TCP connection
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            result = sock.connect_ex((self.config['server'], self.config['port']))
+            sock.close()
+            
+            if result == 0:
+                logger.info(f"TCP connection to {self.config['server']}:{self.config['port']} successful")
+                return True
+            else:
+                logger.error(f"TCP connection failed to {self.config['server']}:{self.config['port']}")
+                return False
+        except Exception as e:
+            logger.error(f"Connection test failed: {e}")
+            return False
     
     def get_connection(self):
-        """Tạo kết nối đến SQL Server"""
-        try:
-            connection = pyodbc.connect(self.connection_string)
-            return connection
-        except Exception as e:
-            logger.error(f"Database connection failed: {e}")
-            raise
+        """Tạo kết nối đến SQL Server với retry logic"""
+        last_error = None
+        
+        # Test TCP connection trước
+        if not self._test_connection():
+            raise Exception(f"Cannot reach SQL Server at {self.config['server']}:{self.config['port']}")
+        
+        for attempt in range(self.max_retries):
+            try:
+                logger.info(f"Attempting database connection {attempt + 1}/{self.max_retries}")
+                
+                connection_string = self._build_connection_string()
+                logger.info(f"Connection string: {connection_string.replace(self.config['password'], '***')}")
+                
+                connection = pyodbc.connect(
+                    connection_string,
+                    timeout=self.config['timeout'],
+                    autocommit=False
+                )
+                
+                # Test connection bằng cách thực hiện một query đơn giản
+                cursor = connection.cursor()
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+                cursor.close()
+                
+                logger.info("Database connection successful!")
+                return connection
+                
+            except pyodbc.Error as e:
+                last_error = e
+                error_code = e.args[0] if e.args else "Unknown"
+                error_message = e.args[1] if len(e.args) > 1 else str(e)
+                
+                logger.error(f"Database connection attempt {attempt + 1} failed:")
+                logger.error(f"Error Code: {error_code}")
+                logger.error(f"Error Message: {error_message}")
+                
+                # Nếu là lỗi timeout hoặc network, thử lại
+                if error_code in ['HYT00', '08001', '08S01'] and attempt < self.max_retries - 1:
+                    logger.info(f"Retrying in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                    continue
+                else:
+                    break
+                    
+            except Exception as e:
+                last_error = e
+                logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+                if attempt < self.max_retries - 1:
+                    logger.info(f"Retrying in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                else:
+                    break
+        
+        # Nếu tất cả attempts đều thất bại
+        error_msg = f"Database connection failed after {self.max_retries} attempts. Last error: {last_error}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
+    
+    def test_connection_variants(self):
+        """Test nhiều variant của connection string"""
+        variants = [
+            # Variant 1: Cơ bản với TCP
+            {
+                'name': 'TCP Connection',
+                'string': f"DRIVER={self.config['driver']};SERVER={self.config['server']},{self.config['port']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;"
+            },
+            # Variant 2: Không chỉ định port
+            {
+                'name': 'Default Port',
+                'string': f"DRIVER={self.config['driver']};SERVER={self.config['server']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;"
+            },
+            # Variant 3: Sử dụng IP với instance
+            {
+                'name': 'IP with Instance',
+                'string': f"DRIVER={self.config['driver']};SERVER={self.config['server']}\\SQLEXPRESS;DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;"
+            },
+            # Variant 4: Trusted connection (nếu có thể)
+            {
+                'name': 'Windows Authentication',
+                'string': f"DRIVER={self.config['driver']};SERVER={self.config['server']},{self.config['port']};DATABASE={self.config['database']};Trusted_Connection=yes;Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;"
+            }
+        ]
+        
+        for variant in variants:
+            try:
+                logger.info(f"Testing {variant['name']}...")
+                connection = pyodbc.connect(variant['string'], timeout=30)
+                cursor = connection.cursor()
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+                cursor.close()
+                connection.close()
+                logger.info(f"✓ {variant['name']} successful!")
+                return variant['string']
+            except Exception as e:
+                logger.error(f"✗ {variant['name']} failed: {e}")
+                continue
+        
+        return None
     
     def create_tables(self):
         """Tạo bảng lưu trữ dữ liệu nếu chưa tồn tại"""
