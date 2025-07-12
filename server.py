@@ -1555,6 +1555,47 @@ async def test_database():
         
     except Exception as e:
         return {"status": "error", "message": str(e)}
+@app.get("/debug-connection")
+async def debug_connection():
+    try:
+        db_manager = DatabaseManager(SQL_SERVER_CONFIG)
+        debug_info = db_manager.comprehensive_debug()
+        
+        return {
+            "status": "debug_complete",
+            "debug_info": debug_info,
+            "recommendations": generate_recommendations(debug_info)
+        }
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def generate_recommendations(debug_info):
+    """Generate recommendations based on debug results"""
+    recommendations = []
+    
+    # Check socket test
+    if not debug_info["tests"]["socket"]["success"]:
+        result_code = debug_info["tests"]["socket"].get("result_code", 0)
+        if result_code == 10061:  # Connection refused
+            recommendations.append("SQL Server is not listening on port 1433. Check if SQL Server is running and TCP/IP is enabled.")
+        elif result_code == 10060:  # Connection timeout
+            recommendations.append("Connection timeout - likely firewall blocking or wrong IP address.")
+        else:
+            recommendations.append(f"Connection failed with code {result_code}")
+    
+    # Check if any ports are open
+    open_ports = [port for port, info in debug_info["tests"]["ports"].items() if info.get("open", False)]
+    if open_ports:
+        recommendations.append(f"Server is reachable on ports: {open_ports}")
+    else:
+        recommendations.append("No ports are accessible - check Radmin VPN connection and IP address.")
+    
+    # Check DNS
+    if not debug_info["tests"]["dns"]["success"]:
+        recommendations.append("DNS resolution failed - using IP address should work better.")
+    
+    return recommendations
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
