@@ -1,6 +1,7 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-playwright==1.40.0
-pdfminer.six==20221105
-requests==2.31.0
-pyodbc==4.0.39
+fastapi
+uvicorn
+playwright
+pdfminer.six
+requests
+pyodbc
+python-dotenv

@@ -13,6 +13,8 @@ import re
 import pyodbc
 from datetime import datetime
 import json
+from dotenv import load_dotenv
+load_dotenv()  # Thêm dòng này sau các import
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -21,20 +23,20 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # Configuration
-CAPTCHA_API_KEY = 'ac625ff477cc0aabf9ce74f3d47472fc'
+CAPTCHA_API_KEY = os.environ.get('CAPTCHA_API_KEY', 'your_default_key')
 TARGET_URL = "https://dangkyquamang.dkkd.gov.vn/egazette/Forms/Egazette/ANNOUNCEMENTSListingInsUpd.aspx"
 SITE_KEY = "6LewYU4UAAAAAD9dQ51Cj_A_1uHLOXw9wJIxi9x0"
 
 SQL_SERVER_CONFIG = {
-    'server': '26.25.148.0',    # IP máy chủ SQL Server qua Radmin
-    'database': 'CompanyDB',    # Tên database
-    'username': 'sa',           # Username SQL Server
-    'password': '123',          # Password SQL Server (đã sửa)
-    'driver': '{ODBC Driver 17 for SQL Server}',  # Driver ODBC
-    'port': 1433,               # Port SQL Server (default 1433)
-    'timeout': 30,              # Connection timeout
-    'encrypt': 'no',            # Thêm để tránh lỗi encryption
-    'trust_server_certificate': 'yes'  # Thêm để tin tưởng certificate
+    'server': os.environ.get('SQL_SERVER', 'localhost'),
+    'database': os.environ.get('SQL_DATABASE', 'CompanyDB'),
+    'username': os.environ.get('SQL_USERNAME', 'sa'),
+    'password': os.environ.get('SQL_PASSWORD', 'your_password'),
+    'driver': '{ODBC Driver 17 for SQL Server}',
+    'port': int(os.environ.get('SQL_PORT', '1433')),
+    'timeout': 30,
+    'encrypt': 'no',
+    'trust_server_certificate': 'yes'
 }
 
 class CaptchaSolver:
@@ -1346,72 +1348,8 @@ async def get_contact_info_internal(mst: str, max_retries: int = 3):
 
 port = int(os.environ.get("PORT", 8000))
 
-@app.get("/company-history")
-async def get_company_history_api(
-    keyword: str = Query(None, description="Keyword to search for"),
-    tax_id: str = Query(None, description="Tax ID to search for"),
-    limit: int = Query(10, description="Number of records to return")
-):
-    """
-    API endpoint để lấy lịch sử tìm kiếm công ty từ database
-    """
-    try:
-        if not keyword and not tax_id:
-            return JSONResponse({"error": "Either keyword or tax_id must be provided"}, status_code=400)
-        
-        results = db_manager.get_company_info(keyword=keyword, tax_id=tax_id)
-        
-        # Giới hạn số lượng kết quả
-        if results:
-            results = results[:limit]
-        
-        return JSONResponse({
-            "keyword": keyword,
-            "tax_id": tax_id,
-            "total_records": len(results),
-            "data": results,
-            "status": "success"
-        })
-        
-    except Exception as e:
-        logger.error(f"Company history API error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
-@app.on_event("startup")
-async def startup_event():
-    """Khởi tạo database khi start application"""
-    try:
-        db_manager.create_tables()
-        logger.info("Database initialization completed")
-    except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
-@app.get("/health-check")
-async def health_check():
-    """Endpoint để kiểm tra tình trạng hệ thống"""
-    checks = {}
-    
-    # Database check
-    try:
-        db_manager.get_connection().close()
-        checks["database"] = "OK"
-    except Exception as e:
-        checks["database"] = f"FAILED: {str(e)}"
-    
-    # Internet check
-    try:
-        response = requests.get('https://httpbin.org/ip', timeout=10)
-        checks["internet"] = "OK"
-        checks["public_ip"] = response.json().get("origin")
-    except Exception as e:
-        checks["internet"] = f"FAILED: {str(e)}"
-    
-    # Captcha API check
-    try:
-        balance = solver.get_balance()
-        checks["captcha_api"] = f"OK (Balance: {balance})"
-    except Exception as e:
-        checks["captcha_api"] = f"FAILED: {str(e)}"
-    
-    return JSONResponse(checks)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
