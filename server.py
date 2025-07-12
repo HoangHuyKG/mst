@@ -28,14 +28,14 @@ TARGET_URL = "https://dangkyquamang.dkkd.gov.vn/egazette/Forms/Egazette/ANNOUNCE
 SITE_KEY = "6LewYU4UAAAAAD9dQ51Cj_A_1uHLOXw9wJIxi9x0"
 
 SQL_SERVER_CONFIG = {
-    'server': os.environ.get('SQL_SERVER', 'localhost'),
+    'server': '26.25.148.0',  # IP của Radmin VPN
     'database': os.environ.get('SQL_DATABASE', 'CompanyDB'),
     'username': os.environ.get('SQL_USERNAME', 'sa'),
     'password': os.environ.get('SQL_PASSWORD', 'your_password'),
     'driver': '{ODBC Driver 17 for SQL Server}',
     'port': int(os.environ.get('SQL_PORT', '1433')),
-    'timeout': 60,  # Tăng timeout lên 60 giây
-    'login_timeout': 60,  # Thêm login timeout
+    'timeout': 60,
+    'login_timeout': 60,
     'encrypt': 'no',
     'trust_server_certificate': 'yes'
 }
@@ -129,7 +129,7 @@ class DatabaseManager:
         self.config = config
         self.max_retries = 3
         self.retry_delay = 5  # giây
-        
+            
     def _build_connection_string(self):
         """Xây dựng connection string với nhiều tùy chọn"""
         # Thử connection string đầy đủ
@@ -1004,44 +1004,6 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                 except:
                     pass
 
-@app.get("/get-contact-info")
-async def get_contact_info_api(mst: str = Query(..., min_length=10, max_length=14)):
-    """API endpoint để lấy thông tin liên hệ (email và điện thoại)"""
-    try:
-        # Check balance
-        balance = await asyncio.to_thread(solver.get_balance)
-        if balance < 0.001:
-            return JSONResponse({"error": "Insufficient balance"}, status_code=400)
-        
-        # Crawl and download
-        pdf_path = await crawl_and_download_pdf(mst)
-        
-        if not pdf_path or not os.path.exists(pdf_path):
-            return JSONResponse({"error": "No results found"}, status_code=404)
-        
-        # Extract contact information from PDF
-        contact_info = extract_pdf_contact_info(pdf_path)
-        
-        if not contact_info:
-            return JSONResponse({"error": "No contact information found in PDF"}, status_code=404)
-        
-        # Clean up PDF file
-        try:
-            os.remove(pdf_path)
-            logger.info(f"Cleaned up PDF file: {pdf_path}")
-        except:
-            pass
-        
-        return JSONResponse({
-            "mst": mst,
-            "email": contact_info.get('email'),
-            "phone": contact_info.get('phone'),
-            "status": "success"
-        })
-        
-    except Exception as e:
-        logger.error(f"API error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/tax-info")
 async def get_tax_info_api(keyword: str = Query(..., min_length=1, description="Keyword to search for tax information")):
@@ -1563,7 +1525,36 @@ async def test_database_connection():
             }
         }, status_code=500)
 
-
+@app.get("/test-db2")
+async def test_database():
+    try:
+        db_manager = DatabaseManager(SQL_SERVER_CONFIG)
+        
+        # Test TCP connection
+        tcp_test = db_manager._test_connection()
+        if not tcp_test:
+            return {"status": "error", "message": "TCP connection failed"}
+        
+        # Test database connection
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT @@VERSION")
+            version = cursor.fetchone()[0]
+            cursor.close()
+            
+        return {
+            "status": "success", 
+            "message": "Database connection successful",
+            "server_version": version,
+            "config": {
+                "server": SQL_SERVER_CONFIG['server'],
+                "port": SQL_SERVER_CONFIG['port'],
+                "database": SQL_SERVER_CONFIG['database']
+            }
+        }
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
