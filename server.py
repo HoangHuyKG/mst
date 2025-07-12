@@ -10,6 +10,9 @@ import logging
 import time
 import requests
 import re
+import pyodbc
+from datetime import datetime
+import json
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -21,6 +24,18 @@ app = FastAPI()
 CAPTCHA_API_KEY = 'ac625ff477cc0aabf9ce74f3d47472fc'
 TARGET_URL = "https://dangkyquamang.dkkd.gov.vn/egazette/Forms/Egazette/ANNOUNCEMENTSListingInsUpd.aspx"
 SITE_KEY = "6LewYU4UAAAAAD9dQ51Cj_A_1uHLOXw9wJIxi9x0"
+
+SQL_SERVER_CONFIG = {
+    'server': '26.25.148.0',    # IP máy chủ SQL Server qua Radmin
+    'database': 'CompanyDB',    # Tên database
+    'username': 'sa',           # Username SQL Server
+    'password': '123',          # Password SQL Server (đã sửa)
+    'driver': '{ODBC Driver 17 for SQL Server}',  # Driver ODBC
+    'port': 1433,               # Port SQL Server (default 1433)
+    'timeout': 30,              # Connection timeout
+    'encrypt': 'no',            # Thêm để tránh lỗi encryption
+    'trust_server_certificate': 'yes'  # Thêm để tin tưởng certificate
+}
 
 class CaptchaSolver:
     def __init__(self, api_key):
@@ -105,7 +120,194 @@ class CaptchaSolver:
                 return float(response.text)
         except ValueError:
             raise Exception(f"Invalid balance response: {response.text}")
-
+        
+class DatabaseManager:
+    def __init__(self, config):
+        self.config = config
+        self.connection_string = (
+            f"DRIVER={config['driver']};"
+            f"SERVER={config['server']},{config['port']};"
+            f"DATABASE={config['database']};"
+            f"UID={config['username']};"
+            f"PWD={config['password']};"
+            f"Encrypt=yes;"
+            f"TrustServerCertificate=yes;"
+            f"Connection Timeout={config['timeout']};"
+        )
+    
+    def get_connection(self):
+        """Tạo kết nối đến SQL Server"""
+        try:
+            connection = pyodbc.connect(self.connection_string)
+            return connection
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            raise
+    
+    def create_tables(self):
+        """Tạo bảng lưu trữ dữ liệu nếu chưa tồn tại"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Tạo bảng company_info
+                create_table_query = """
+                IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='company_info' AND xtype='U')
+                CREATE TABLE company_info (
+                    id INT IDENTITY(1,1) PRIMARY KEY,
+                    keyword NVARCHAR(255) NOT NULL,
+                    tax_id NVARCHAR(50),
+                    company_name NVARCHAR(500),
+                    address NVARCHAR(1000),
+                    legal_representative NVARCHAR(255),
+                    start_date NVARCHAR(100),
+                    status NVARCHAR(255),
+                    company_type NVARCHAR(255),
+                    email NVARCHAR(255),
+                    phone NVARCHAR(50),
+                    raw_data NVARCHAR(MAX),
+                    created_at DATETIME DEFAULT GETDATE(),
+                    updated_at DATETIME DEFAULT GETDATE()
+                )
+                """
+                
+                cursor.execute(create_table_query)
+                conn.commit()
+                logger.info("Database tables created successfully")
+                
+        except Exception as e:
+            logger.error(f"Error creating tables: {e}")
+            raise
+    
+    def save_company_info(self, keyword, tax_info, contact_info):
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Chuẩn bị dữ liệu
+                tax_data = tax_info or {}
+                contact_data = contact_info or {}
+                
+                # Xử lý logic ưu tiên phone
+                final_phone = None
+                phone_source = None
+                
+                if tax_data.get('phone'):
+                    # Ưu tiên phone từ masothue.com
+                    final_phone = tax_data.get('phone')
+                    phone_source = "masothue.com"
+                elif contact_data.get('phone'):
+                    # Fallback sang phone từ PDF
+                    final_phone = contact_data.get('phone')
+                    phone_source = "pdf"
+                
+                # Kiểm tra xem record đã tồn tại chưa
+                check_query = "SELECT id FROM company_info WHERE keyword = ? AND tax_id = ?"
+                cursor.execute(check_query, (keyword, tax_data.get('taxID')))
+                existing_record = cursor.fetchone()
+                
+                if existing_record:
+                    # Cập nhật record hiện tại
+                    update_query = """
+                    UPDATE company_info 
+                    SET company_name = ?, address = ?, legal_representative = ?, 
+                        start_date = ?, status = ?, company_type = ?, 
+                        email = ?, phone = ?, raw_data = ?, updated_at = GETDATE()
+                    WHERE id = ?
+                    """
+                    
+                    cursor.execute(update_query, (
+                        tax_data.get('companyName'),
+                        tax_data.get('address'),
+                        tax_data.get('legalRepresentative'),
+                        tax_data.get('startDate'),
+                        tax_data.get('status'),
+                        tax_data.get('companyType'),
+                        contact_data.get('email'),
+                        final_phone,  # Sử dụng phone đã được xử lý
+                        json.dumps({
+                            'tax_info': tax_data, 
+                            'contact_info': contact_data,
+                            'phone_source': phone_source,
+                            'final_phone': final_phone
+                        }, ensure_ascii=False),
+                        existing_record[0]
+                    ))
+                    
+                    logger.info(f"Updated existing record for keyword: {keyword}, phone source: {phone_source}")
+                    
+                else:
+                    # Thêm record mới
+                    insert_query = """
+                    INSERT INTO company_info 
+                    (keyword, tax_id, company_name, address, legal_representative, 
+                    start_date, status, company_type, email, phone, raw_data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """
+                    
+                    cursor.execute(insert_query, (
+                        keyword,
+                        tax_data.get('taxID'),
+                        tax_data.get('companyName'),
+                        tax_data.get('address'),
+                        tax_data.get('legalRepresentative'),
+                        tax_data.get('startDate'),
+                        tax_data.get('status'),
+                        tax_data.get('companyType'),
+                        contact_data.get('email'),
+                        final_phone,  # Sử dụng phone đã được xử lý
+                        json.dumps({
+                            'tax_info': tax_data, 
+                            'contact_info': contact_data,
+                            'phone_source': phone_source,
+                            'final_phone': final_phone
+                        }, ensure_ascii=False)
+                    ))
+                    
+                    logger.info(f"Inserted new record for keyword: {keyword}, phone source: {phone_source}")
+                
+                conn.commit()
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error saving company info: {e}")
+            return False
+    
+    def get_company_info(self, keyword=None, tax_id=None):
+        """Lấy thông tin công ty từ database"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                if keyword:
+                    query = "SELECT * FROM company_info WHERE keyword = ? ORDER BY created_at DESC"
+                    cursor.execute(query, (keyword,))
+                elif tax_id:
+                    query = "SELECT * FROM company_info WHERE tax_id = ? ORDER BY created_at DESC"
+                    cursor.execute(query, (tax_id,))
+                else:
+                    query = "SELECT * FROM company_info ORDER BY created_at DESC"
+                    cursor.execute(query)
+                
+                columns = [column[0] for column in cursor.description]
+                results = []
+                
+                for row in cursor.fetchall():
+                    row_dict = dict(zip(columns, row))
+                    # Parse raw_data JSON
+                    if row_dict.get('raw_data'):
+                        try:
+                            row_dict['raw_data'] = json.loads(row_dict['raw_data'])
+                        except:
+                            pass
+                    results.append(row_dict)
+                
+                return results
+                
+        except Exception as e:
+            logger.error(f"Error getting company info: {e}")
+            return []
+        
 def extract_text_pdfminer(pdf_path):
     """Trích xuất text từ PDF bằng pdfminer"""
     try:
@@ -156,9 +358,7 @@ def clean_text(text):
     
     return text.strip()
 
-import re
 
-import re
 
 def extract_contact_info(text):
     """Trích xuất chỉ email và điện thoại từ text"""
@@ -282,6 +482,7 @@ def extract_pdf_contact_info(pdf_path):
         return None
 
 solver = CaptchaSolver(CAPTCHA_API_KEY)
+db_manager = DatabaseManager(SQL_SERVER_CONFIG)
 
 async def inject_captcha_response(page, captcha_code):
     """Inject captcha response safely"""
@@ -313,172 +514,344 @@ async def inject_captcha_response(page, captcha_code):
         return False
 
 async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
-    """Enhanced crawl function with better error handling and retries"""
+    """Fixed crawl function with correct Playwright syntax"""
     browser = None
+    
+    # Danh sách các loại đăng ký để thử theo thứ tự
+    registration_types = [
+        ('NEW', 'Đăng ký mới'),
+        ('AMEND', 'Đăng ký thay đổi')
+    ]
     
     for attempt in range(max_retries):
         try:
             logger.info(f"Attempt {attempt + 1}/{max_retries} for MST: {mst}")
             
             async with async_playwright() as p:
-                # Optimized browser configuration for production
+                # Cấu hình browser
                 browser = await p.chromium.launch(
-                    headless=True,
+                    headless=True,  # Để debug, đổi thành True khi deploy
                     args=[
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-dev-shm-usage',
-                        '--disable-extensions',
-                        '--disable-plugins',
                         '--disable-blink-features=AutomationControlled',
-                        '--disable-background-timer-throttling',
-                        '--disable-backgrounding-occluded-windows',
-                        '--disable-renderer-backgrounding',
-                        '--disable-features=TranslateUI',
-                        '--disable-ipc-flooding-protection',
-                        '--single-process',
-                        '--disable-gpu',
-                        '--disable-software-rasterizer',
                         '--disable-web-security',
-                        '--disable-features=site-per-process',
-                        '--memory-pressure-off',
-                        '--max_old_space_size=4096'
+                        '--disable-features=VizDisplayCompositor',
+                        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                     ]
                 )
                 
+                # Tạo context KHÔNG có timeout parameter
                 context = await browser.new_context(
                     viewport={'width': 1366, 'height': 768},
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    # Tăng timeout cho từng request
-                    timeout=120000,  # 2 phút
-                    # Giảm resource usage
+                    extra_http_headers={
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1'
+                    },
                     ignore_https_errors=True,
                     java_script_enabled=True
                 )
                 
-                # Block unnecessary resources to speed up
+                # Set timeout cho context sau khi tạo
+                context.set_default_timeout(180000)  # 3 phút
+                
+                # Chỉ chặn media files, giữ lại CSS và JS
                 await context.route("**/*", lambda route: route.abort() 
-                    if route.request.resource_type in ["image", "font", "media", "stylesheet"] 
+                    if route.request.resource_type in ["image", "media"] 
                     else route.continue_())
                 
                 page = await context.new_page()
                 
-                # Set longer timeout for navigation
-                page.set_default_timeout(120000)  # 2 phút
+                # Set timeout cho page
+                page.set_default_timeout(180000)  # 3 phút
                 
-                # Navigate with retry logic
-                logger.info(f"Navigating to target URL for MST: {mst}")
+                # Thêm error handlers
+                page.on("pageerror", lambda error: logger.error(f"Page error: {error}"))
+                page.on("console", lambda msg: logger.info(f"Console: {msg.text}"))
                 
-                # Try to navigate with exponential backoff
-                for nav_attempt in range(3):
+                # Thử từng loại đăng ký
+                for reg_type, reg_name in registration_types:
+                    logger.info(f"Trying registration type: {reg_name} ({reg_type})")
+                    
                     try:
-                        await page.goto(TARGET_URL, timeout=120000, wait_until='domcontentloaded')
-                        logger.info("Successfully navigated to target URL")
-                        break
-                    except Exception as nav_error:
-                        logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
-                        if nav_attempt == 2:
-                            raise nav_error
-                        await asyncio.sleep(2 ** nav_attempt)  # Exponential backoff
-                
-                # Wait for page to be ready
-                await page.wait_for_load_state('domcontentloaded')
-                
-                # Wait for form elements with explicit timeout
-                try:
-                    await page.wait_for_selector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', timeout=30000)
-                    logger.info("Form elements loaded successfully")
-                except Exception as e:
-                    logger.error(f"Form elements not found: {e}")
-                    raise Exception("Form elements not loaded")
-                
-                # Fill form with delays
-                logger.info("Filling form...")
-                await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', 'AMEND')
-                await page.wait_for_timeout(3000)  # Tăng delay
-                await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
-                await page.wait_for_timeout(2000)
-                
-                # Solve captcha with retry
-                logger.info("Solving captcha...")
-                captcha_code = None
-                for captcha_attempt in range(2):
-                    try:
-                        captcha_code = await asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL)
-                        logger.info("Captcha solved successfully")
-                        break
-                    except Exception as captcha_error:
-                        logger.warning(f"Captcha attempt {captcha_attempt + 1} failed: {captcha_error}")
-                        if captcha_attempt == 1:
-                            raise captcha_error
-                        await asyncio.sleep(5)
-                
-                if not captcha_code:
-                    raise Exception("Failed to solve captcha")
-                
-                # Inject captcha response
-                success = await inject_captcha_response(page, captcha_code)
-                if not success:
-                    raise Exception("Failed to inject captcha response")
-                
-                await page.wait_for_timeout(3000)
-                
-                # Submit form
-                logger.info("Submitting form...")
-                await page.click('#ctl00_C_BtnFilter')
-                
-                # Wait for results with longer timeout
-                await page.wait_for_load_state('domcontentloaded', timeout=60000)
-                
-                # Check for results
-                try:
-                    await page.wait_for_selector('#ctl00_C_CtlList', timeout=45000)
-                    logger.info("Results table found")
-                except Exception:
-                    # Check if no results message appears
-                    try:
-                        no_results = await page.wait_for_selector('text=Không tìm thấy dữ liệu', timeout=10000)
-                        if no_results:
-                            logger.info("No results found for this MST")
-                            return None
-                    except:
-                        pass
+                        # Step 1: Navigate với retry logic
+                        logger.info(f"Navigating to target URL for MST: {mst}")
+                        
+                        for nav_attempt in range(3):
+                            try:
+                                logger.info(f"Navigation attempt {nav_attempt + 1}/3")
+                                
+                                # Thử truy cập trang
+                                response = await page.goto(
+                                    TARGET_URL, 
+                                    timeout=180000, 
+                                    wait_until='networkidle'
+                                )
+                                
+                                # Kiểm tra response status
+                                if response and response.status >= 400:
+                                    logger.error(f"HTTP error: {response.status}")
+                                    raise Exception(f"HTTP {response.status} error")
+                                
+                                logger.info(f"Successfully navigated to target URL. Status: {response.status if response else 'Unknown'}")
+                                
+                                # Đợi một chút để trang stable
+                                await page.wait_for_timeout(5000)
+                                break
+                                
+                            except Exception as nav_error:
+                                logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
+                                if nav_attempt == 2:
+                                    logger.error("All navigation attempts failed")
+                                    raise nav_error
+                                await asyncio.sleep(3)
+                        
+                        # Step 2: Wait for form elements
+                        logger.info("Waiting for form elements...")
+                        
+                        # Thử multiple selectors
+                        selectors_to_try = [
+                            '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld',
+                            'select[name*="ANNOUNCEMENT_TYPE"]',
+                            'select[id*="ANNOUNCEMENT_TYPE"]'
+                        ]
+                        
+                        form_found = False
+                        for selector in selectors_to_try:
+                            try:
+                                await page.wait_for_selector(selector, timeout=30000)
+                                logger.info(f"Found form element with selector: {selector}")
+                                form_found = True
+                                break
+                            except Exception as e:
+                                logger.warning(f"Selector {selector} not found: {e}")
+                                continue
+                        
+                        if not form_found:
+                            # Debug: In ra HTML của trang
+                            page_content = await page.content()
+                            logger.error("Form not found. Page content preview:")
+                            logger.error(page_content[:1000] + "...")
+                            raise Exception("Form elements not found on page")
+                        
+                        # Step 3: Fill form
+                        logger.info(f"Filling form with registration type: {reg_name}")
+                        
+                        try:
+                            # Thử fill form với exception handling
+                            await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', reg_type)
+                            await page.wait_for_timeout(3000)
+                            
+                            await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
+                            await page.wait_for_timeout(2000)
+                            
+                            logger.info("Form filled successfully")
+                            
+                        except Exception as form_error:
+                            logger.error(f"Form filling failed: {form_error}")
+                            
+                            # Debug: Kiểm tra các elements có tồn tại không
+                            elements_info = await page.evaluate("""
+                                () => {
+                                    const info = {};
+                                    const typeSelect = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
+                                    const codeInput = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
+                                    
+                                    info.typeSelectExists = !!typeSelect;
+                                    info.codeInputExists = !!codeInput;
+                                    
+                                    if (typeSelect) {
+                                        info.typeSelectOptions = Array.from(typeSelect.options).map(opt => opt.value);
+                                    }
+                                    
+                                    return info;
+                                }
+                            """)
+                            
+                            logger.error(f"Form elements info: {elements_info}")
+                            raise form_error
+                        
+                        # Step 4: Solve captcha
+                        logger.info("Solving captcha...")
+                        captcha_code = None
+                        
+                        for captcha_attempt in range(2):
+                            try:
+                                captcha_code = await asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL)
+                                logger.info("Captcha solved successfully")
+                                break
+                            except Exception as captcha_error:
+                                logger.warning(f"Captcha attempt {captcha_attempt + 1} failed: {captcha_error}")
+                                if captcha_attempt == 1:
+                                    raise captcha_error
+                                await asyncio.sleep(5)
+                        
+                        if not captcha_code:
+                            raise Exception("Failed to solve captcha")
+                        
+                        # Step 5: Inject captcha
+                        success = await inject_captcha_response(page, captcha_code)
+                        if not success:
+                            raise Exception("Failed to inject captcha response")
+                        
+                        await page.wait_for_timeout(3000)
+                        
+                        # Step 6: Submit form
+                        logger.info("Submitting form...")
+                        
+                        try:
+                            await page.click('#ctl00_C_BtnFilter')
+                            logger.info("Form submitted successfully")
+                        except Exception as submit_error:
+                            logger.error(f"Form submission failed: {submit_error}")
+                            raise submit_error
+                        
+                        # Step 7: Wait for results
+                        logger.info("Waiting for results...")
+                        
+                        await page.wait_for_load_state('networkidle', timeout=120000)
+                        
+                        # Check for results table
+                        try:
+                            await page.wait_for_selector('#ctl00_C_CtlList', timeout=45000)
+                            logger.info("Results table found")
+                        except Exception:
+                            # Check for no results message
+                            try:
+                                no_results_selectors = [
+                                    'text=Không tìm thấy dữ liệu',
+                                    'text=No data found',
+                                    '.no-results',
+                                    '[id*="NoData"]'
+                                ]
+                                
+                                for selector in no_results_selectors:
+                                    try:
+                                        await page.wait_for_selector(selector, timeout=5000)
+                                        logger.info(f"No results found with selector: {selector} for {reg_name}")
+                                        break
+                                    except:
+                                        continue
+                                else:
+                                    logger.error("Results table not found within timeout")
+                                    
+                                    # Debug: Lấy thông tin trang sau khi submit
+                                    current_url = page.url
+                                    page_title = await page.title()
+                                    logger.error(f"Current URL: {current_url}")
+                                    logger.error(f"Page title: {page_title}")
+                                    
+                                    # Lưu screenshot để debug
+                                    try:
+                                        await page.screenshot(path=f"debug_{mst}_{reg_type}_{attempt}.png")
+                                        logger.info(f"Screenshot saved: debug_{mst}_{reg_type}_{attempt}.png")
+                                    except:
+                                        pass
+                                    
+                                    raise Exception("Results table not found")
+                                
+                                # Nếu không có kết quả, thử loại đăng ký tiếp theo
+                                logger.info(f"No results found for {reg_name}, trying next registration type...")
+                                continue
+                            except:
+                                pass
+                        
+                        # Step 8: Find and download PDF
+                        logger.info("Looking for PDF download button...")
+                        
+                        # Thử multiple selectors cho PDF button
+                        pdf_selectors = [
+                            'input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]',
+                            'a[href*="pdf"]',
+                            'input[value*="PDF"]',
+                            'button[onclick*="pdf"]'
+                        ]
+                        
+                        pdf_button = None
+                        for selector in pdf_selectors:
+                            try:
+                                pdf_button = await page.query_selector(selector)
+                                if pdf_button:
+                                    logger.info(f"Found PDF button with selector: {selector}")
+                                    break
+                            except Exception as e:
+                                logger.warning(f"PDF selector {selector} failed: {e}")
+                                continue
+                        
+                        if not pdf_button:
+                            logger.info(f"No PDF button found for {reg_name}")
+                            # Nếu là loại đăng ký cuối cùng, return None
+                            if reg_type == registration_types[-1][0]:
+                                logger.info("No PDF found in any registration type")
+                                return None
+                            else:
+                                # Thử loại đăng ký tiếp theo
+                                logger.info(f"Trying next registration type...")
+                                continue
+                        
+                        # Step 9: Download PDF
+                        logger.info(f"Downloading PDF for {reg_name}...")
+                        
+                        file_name = f"{mst}_{reg_type}_{uuid.uuid4().hex[:8]}.pdf"
+                        download_path = os.path.join(os.getcwd(), file_name)
+                        
+                        try:
+                            async with page.expect_download(timeout=120000) as download_info:
+                                await pdf_button.click()
+                                logger.info("Clicked PDF download button")
+                            
+                            download = await download_info.value
+                            await download.save_as(download_path)
+                            logger.info(f"PDF downloaded successfully: {file_name}")
+                            
+                            # Verify file exists and has content
+                            if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
+                                logger.info(f"PDF file verified: {os.path.getsize(download_path)} bytes")
+                                logger.info(f"Successfully downloaded PDF from {reg_name}")
+                                return file_name
+                            else:
+                                logger.error("Downloaded PDF file is empty or doesn't exist")
+                                # Nếu file rỗng, thử loại đăng ký tiếp theo
+                                if reg_type != registration_types[-1][0]:
+                                    logger.info("Empty PDF, trying next registration type...")
+                                    continue
+                                else:
+                                    return None
+                            
+                        except Exception as download_error:
+                            logger.error(f"Download failed for {reg_name}: {download_error}")
+                            # Nếu download fail và không phải loại cuối cùng, thử loại tiếp theo
+                            if reg_type != registration_types[-1][0]:
+                                logger.info("Download failed, trying next registration type...")
+                                continue
+                            else:
+                                raise Exception(f"PDF download failed for all registration types. Last error: {download_error}")
                     
-                    logger.error("Results table not found within timeout")
-                    raise Exception("Results table not found")
+                    except Exception as reg_error:
+                        logger.error(f"Registration type {reg_name} failed: {reg_error}")
+                        # Nếu không phải loại cuối cùng, thử loại tiếp theo
+                        if reg_type != registration_types[-1][0]:
+                            logger.info("Current registration type failed, trying next...")
+                            continue
+                        else:
+                            # Nếu là loại cuối cùng, raise error
+                            raise reg_error
                 
-                # Find and click PDF button
-                pdf_button = await page.query_selector('input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]')
-                if not pdf_button:
-                    logger.info("No PDF button found - no results available")
-                    return None
-                
-                # Download PDF
-                file_name = f"{mst}_{uuid.uuid4().hex[:8]}.pdf"
-                download_path = os.path.join(os.getcwd(), file_name)
-                
-                # Setup download handler with timeout
-                try:
-                    async with page.expect_download(timeout=60000) as download_info:
-                        await pdf_button.click()
-                        logger.info("Clicked PDF download button")
-                    
-                    download = await download_info.value
-                    await download.save_as(download_path)
-                    logger.info(f"PDF downloaded successfully: {file_name}")
-                    
-                    return file_name
-                    
-                except Exception as download_error:
-                    logger.error(f"Download failed: {download_error}")
-                    raise Exception(f"PDF download failed: {download_error}")
+                # Nếu đã thử hết tất cả các loại đăng ký mà không thành công
+                logger.error("All registration types failed")
+                return None
                 
         except Exception as e:
             logger.error(f"Attempt {attempt + 1} failed: {e}")
             if attempt == max_retries - 1:
                 raise Exception(f"All {max_retries} attempts failed. Last error: {e}")
             
-            # Wait before retry with exponential backoff
+            # Wait before retry
             wait_time = 2 ** attempt
             logger.info(f"Waiting {wait_time} seconds before retry...")
             await asyncio.sleep(wait_time)
@@ -649,7 +1022,7 @@ async def get_tax_info_api(keyword: str = Query(..., min_length=1, description="
 @app.get("/combined-info")
 async def get_combined_info_api(keyword: str = Query(..., min_length=1, description="Keyword to search for tax information")):
     """
-    Enhanced API endpoint với better error handling và retry logic
+    Enhanced API endpoint với phone priority logic: masothue.com phone first, then PDF phone
     """
     try:
         # Step 1: Get tax info with retry
@@ -679,17 +1052,70 @@ async def get_combined_info_api(keyword: str = Query(..., min_length=1, descript
         
         contact_info = await get_contact_info_internal(mst, max_retries=3)
         
-        # Step 3: Combine results
+        # Step 3: Combine results with phone priority logic
+        tax_data = tax_info['data']
+        pdf_contact = contact_info if contact_info else {}
+
+        # Logic ưu tiên: phone từ masothue.com, nếu không có thì lấy từ PDF
+        # Email chỉ lấy từ PDF
+        final_phone = None
+        phone_source = None
+
+        if tax_data.get('phone'):
+            # Có phone từ masothue.com
+            final_phone = tax_data.get('phone')
+            phone_source = "masothue.com"
+            logger.info(f"Using phone from masothue.com: {final_phone}")
+        elif pdf_contact.get('phone'):
+            # Không có phone từ masothue.com, lấy từ PDF
+            final_phone = pdf_contact.get('phone')
+            phone_source = "pdf"
+            logger.info(f"Using phone from PDF: {final_phone}")
+        else:
+            logger.info("No phone number found from any source")
+
+        # Tạo final_contact_info với phone đã được xử lý
+        final_contact_info = {
+            "phone": final_phone,
+            "email": pdf_contact.get('email'),
+            "phone_source": phone_source,
+            "email_source": "pdf" if pdf_contact.get('email') else None
+        }
+
         combined_result = {
             "keyword": keyword,
-            "tax_info": tax_info['data'],
-            "contact_info": contact_info if contact_info else {
-                "email": None,
-                "phone": None,
-                "note": "No contact information found or PDF not available"
-            },
+            "tax_info": tax_data,
+            "contact_info": final_contact_info,
             "status": "success"
         }
+        
+        # Step 4: Save to database với phone đã được xử lý
+        try:
+            # Tạo contact_info_for_db với phone đã được ưu tiên
+            contact_info_for_db = {
+                "phone": final_phone,
+                "email": pdf_contact.get('email'),
+                "phone_source": phone_source,
+                "email_source": "pdf" if pdf_contact.get('email') else None
+            }
+            
+            db_saved = db_manager.save_company_info(
+                keyword=keyword,
+                tax_info=tax_data,
+                contact_info=contact_info_for_db
+            )
+            
+            if db_saved:
+                combined_result["database_status"] = "saved"
+                logger.info(f"Successfully saved to database for keyword: {keyword}")
+            else:
+                combined_result["database_status"] = "failed"
+                logger.warning(f"Failed to save to database for keyword: {keyword}")
+                
+        except Exception as db_error:
+            logger.error(f"Database save error: {db_error}")
+            combined_result["database_status"] = "error"
+            combined_result["database_error"] = str(db_error)
         
         logger.info(f"Successfully combined information for keyword: {keyword}")
         
@@ -703,124 +1129,170 @@ async def get_combined_info_api(keyword: str = Query(..., min_length=1, descript
         }, status_code=500)
     
 async def get_tax_info_internal(keyword: str, max_retries: int = 3):
-    """Enhanced tax info function with better error handling"""
+    """Fixed tax info function with correct Playwright syntax"""
     browser = None
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-    headless=True,  # Bắt buộc phải là True trên server
-    args=[
-        '--no-sandbox',
-        '--disable-setuid-sandbox', 
-        '--disable-dev-shm-usage',
-        '--disable-extensions',
-        '--disable-plugins',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--disable-features=TranslateUI',
-        '--disable-ipc-flooding-protection',
-        '--single-process'  # Quan trọng cho môi trường container
-    ]
-)
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Tax info attempt {attempt + 1}/{max_retries} for keyword: {keyword}")
             
-            context = await browser.new_context(
-                viewport={'width': 1280, 'height': 800},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114 Safari/537.36'
-            )
-            
-            page = await context.new_page()
-            
-            # Chặn tài nguyên không cần thiết
-            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
-            
-            logger.info(f"Navigating to masothue.com for keyword: {keyword}")
-            
-            # Truy cập trang web
-            await page.goto('https://masothue.com', timeout=60000)
-            await page.wait_for_load_state('domcontentloaded')
-            
-            # Đợi input search xuất hiện
-            await page.wait_for_selector('input[name="q"]', timeout=10000)
-            
-            # Nhập keyword và tìm kiếm
-            await page.fill('input[name="q"]', keyword)
-            
-            # Click nút tìm kiếm và đợi navigation
-            await page.click('.btn-search-submit')
-            await page.wait_for_load_state('domcontentloaded')
-            
-            # Đợi bảng kết quả tải xong
-            await page.wait_for_selector('table.table-taxinfo tbody', timeout=10000)
-            
-            # Trích xuất dữ liệu
-            result = await page.evaluate("""
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,  # Bắt buộc phải là True trên server
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox', 
+                        '--disable-dev-shm-usage',
+                        '--disable-extensions',
+                        '--disable-plugins',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-features=TranslateUI',
+                        '--disable-ipc-flooding-protection',
+                        '--single-process'
+                    ]
+                )
+                
+                # Tạo context KHÔNG có timeout parameter
+                context = await browser.new_context(
+                    viewport={'width': 1280, 'height': 800},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114 Safari/537.36'
+                )
+                
+                # Set timeout cho context sau khi tạo
+                context.set_default_timeout(60000)  # 1 phút
+                
+                page = await context.new_page()
+                
+                # Set timeout cho page
+                page.set_default_timeout(60000)
+                
+                # Chặn tài nguyên không cần thiết
+                await page.route("**/*", lambda route: route.abort() 
+                    if route.request.resource_type in ["image", "font", "media"] 
+                    else route.continue_())
+                
+                logger.info(f"Navigating to masothue.com for keyword: {keyword}")
+                
+                # Truy cập trang web
+                await page.goto('https://masothue.com', timeout=60000)
+                await page.wait_for_load_state('domcontentloaded')
+                
+                # Đợi input search xuất hiện
+                await page.wait_for_selector('input[name="q"]', timeout=60000)
+                
+                # Nhập keyword và tìm kiếm
+                await page.fill('input[name="q"]', keyword)
+                
+                # Click nút tìm kiếm và đợi navigation
+                await page.click('.btn-search-submit')
+                await page.wait_for_load_state('domcontentloaded')
+                
+                # Đợi bảng kết quả tải xong
+                await page.wait_for_selector('table.table-taxinfo tbody', timeout=60000)
+                
+                # Trích xuất dữ liệu
+                result = await page.evaluate("""
                 () => {
                     const result = {};
+
+                // Lấy tên công ty từ header
+                const companyNameHeader = document.querySelector('table.table-taxinfo thead th[itemprop="name"] .copy');
+                if (companyNameHeader) {
+                    result.companyName = companyNameHeader.getAttribute('title') || companyNameHeader.innerText.trim();
+                }
+
+                // Lấy các thông tin từ tbody
+                const rows = Array.from(document.querySelectorAll('table.table-taxinfo tbody tr'));
+
+                rows.forEach(row => {
+                    const label = row.querySelector('td:first-child')?.innerText.trim();
+                    const valueCell = row.querySelector('td:nth-child(2)');
+                    if (!label || !valueCell) return;
                     
-                    // Lấy tên công ty từ header
-                    const companyNameHeader = document.querySelector('table.table-taxinfo thead th[itemprop="name"] .copy');
-                    if (companyNameHeader) {
-                        result.companyName = companyNameHeader.getAttribute('title') || companyNameHeader.innerText.trim();
+                    let value = valueCell.innerText.trim();
+                    
+                    // Xử lý trường hợp người đại diện - lấy tên từ thẻ a hoặc span
+                    if (label.includes('Người đại diện')) {
+                        const nameElement = valueCell.querySelector('[itemprop="name"]');
+                        if (nameElement) {
+                            value = nameElement.innerText.trim();
+                        }
                     }
                     
-                    // Lấy các thông tin từ tbody
-                    const rows = Array.from(document.querySelectorAll('table.table-taxinfo tbody tr'));
-                    
-                    rows.forEach(row => {
-                        const label = row.querySelector('td:first-child')?.innerText.trim();
-                        const valueCell = row.querySelector('td:nth-child(2)');
-                        if (!label || !valueCell) return;
-                        
-                        let value = valueCell.innerText.trim();
-                        
-                        // Xử lý trường hợp người đại diện - lấy tên từ thẻ a hoặc span
-                        if (label.includes('Người đại diện')) {
-                            const nameElement = valueCell.querySelector('[itemprop="name"]');
-                            if (nameElement) {
-                                value = nameElement.innerText.trim();
+                    // Xử lý trường hợp điện thoại - ưu tiên lấy từ span.copy
+                    if (label.includes('Điện thoại')) {
+                        // Thử lấy từ span có class="copy" trước
+                        const phoneElement = valueCell.querySelector('span.copy');
+                        if (phoneElement) {
+                            const phoneNumber = phoneElement.getAttribute('title') || phoneElement.innerText.trim();
+                            // Chỉ lấy số điện thoại nếu không bị ẩn
+                            if (phoneNumber && !phoneNumber.includes('Bị ẩn') && !phoneNumber.includes('*') && phoneNumber.length > 5) {
+                                result.phone = phoneNumber;
+                                console.log('Phone found from masothue.com:', phoneNumber);
+                            }
+                        } else {
+                            // Fallback: lấy từ text content nếu không có span.copy
+                            const phoneText = valueCell.innerText.trim();
+                            if (phoneText && !phoneText.includes('Bị ẩn') && !phoneText.includes('*') && phoneText.length > 5) {
+                                // Regex để extract phone number
+                                const phoneMatch = phoneText.match(/(\d{2,4}[\.\-\s]?\d{3,4}[\.\-\s]?\d{3,4}[\.\-\s]?\d{0,4}|\d{9,11})/);
+                                if (phoneMatch) {
+                                    result.phone = phoneMatch[1];
+                                    console.log('Phone extracted from text:', phoneMatch[1]);
+                                }
                             }
                         }
-                        
-                        // Mapping chỉ các trường cần thiết
-                        if (label.includes('Mã số thuế')) {
-                            result.taxID = value;
-                        } else if (label.includes('Địa chỉ')) {
-                            result.address = value;
-                        } else if (label.includes('Người đại diện')) {
-                            result.legalRepresentative = value;
-                        } else if (label.includes('Ngày hoạt động')) {
-                            result.startDate = value;
-                        } else if (label.includes('Tình trạng')) {
-                            result.status = value;
-                        } else if (label.includes('Loại hình DN')) {
-                            result.companyType = value;
-                        }
-                    });
+                    }
                     
+                    // Mapping các trường khác
+                    if (label.includes('Mã số thuế')) {
+                        result.taxID = value;
+                    } else if (label.includes('Địa chỉ')) {
+                        result.address = value;
+                    } else if (label.includes('Người đại diện')) {
+                        result.legalRepresentative = value;
+                    } else if (label.includes('Ngày hoạt động')) {
+                        result.startDate = value;
+                    } else if (label.includes('Tình trạng')) {
+                        result.status = value;
+                    } else if (label.includes('Loại hình DN')) {
+                        result.companyType = value;
+                    }
+                });
+
                     return result;
+                    
                 }
-            """)
+                """)
+
+                
+                logger.info(f"Successfully scraped tax info for keyword: {keyword}")
+                
+                return {
+                    "keyword": keyword,
+                    "data": result,
+                    "status": "success"
+                }
+                
+        except Exception as e:
+            logger.error(f"Tax info attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                raise Exception(f"Failed to fetch tax info after {max_retries} attempts: {str(e)}")
             
-            logger.info(f"Successfully scraped tax info for keyword: {keyword}")
-            
-            return {
-                "keyword": keyword,
-                "data": result,
-                "status": "success"
-            }
-            
-    except Exception as e:
-        logger.error(f"Tax info scraping failed: {e}")
-        raise Exception(f"Failed to fetch tax info: {str(e)}")
-        
-    finally:
-        if browser:
-            try:
-                await browser.close()
-            except:
-                pass
+            # Wait before retry
+            wait_time = 2 ** attempt
+            logger.info(f"Waiting {wait_time} seconds before retry...")
+            await asyncio.sleep(wait_time)
+                
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except:
+                    pass
 
 async def get_contact_info_internal(mst: str, max_retries: int = 3):
     """Enhanced contact info function with retry logic"""
@@ -874,6 +1346,72 @@ async def get_contact_info_internal(mst: str, max_retries: int = 3):
 
 port = int(os.environ.get("PORT", 8000))
 
+@app.get("/company-history")
+async def get_company_history_api(
+    keyword: str = Query(None, description="Keyword to search for"),
+    tax_id: str = Query(None, description="Tax ID to search for"),
+    limit: int = Query(10, description="Number of records to return")
+):
+    """
+    API endpoint để lấy lịch sử tìm kiếm công ty từ database
+    """
+    try:
+        if not keyword and not tax_id:
+            return JSONResponse({"error": "Either keyword or tax_id must be provided"}, status_code=400)
+        
+        results = db_manager.get_company_info(keyword=keyword, tax_id=tax_id)
+        
+        # Giới hạn số lượng kết quả
+        if results:
+            results = results[:limit]
+        
+        return JSONResponse({
+            "keyword": keyword,
+            "tax_id": tax_id,
+            "total_records": len(results),
+            "data": results,
+            "status": "success"
+        })
+        
+    except Exception as e:
+        logger.error(f"Company history API error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+@app.on_event("startup")
+async def startup_event():
+    """Khởi tạo database khi start application"""
+    try:
+        db_manager.create_tables()
+        logger.info("Database initialization completed")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+@app.get("/health-check")
+async def health_check():
+    """Endpoint để kiểm tra tình trạng hệ thống"""
+    checks = {}
+    
+    # Database check
+    try:
+        db_manager.get_connection().close()
+        checks["database"] = "OK"
+    except Exception as e:
+        checks["database"] = f"FAILED: {str(e)}"
+    
+    # Internet check
+    try:
+        response = requests.get('https://httpbin.org/ip', timeout=10)
+        checks["internet"] = "OK"
+        checks["public_ip"] = response.json().get("origin")
+    except Exception as e:
+        checks["internet"] = f"FAILED: {str(e)}"
+    
+    # Captcha API check
+    try:
+        balance = solver.get_balance()
+        checks["captcha_api"] = f"OK (Balance: {balance})"
+    except Exception as e:
+        checks["captcha_api"] = f"FAILED: {str(e)}"
+    
+    return JSONResponse(checks)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
