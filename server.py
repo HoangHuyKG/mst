@@ -434,7 +434,259 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error getting company info: {e}")
             return []
+# Add this to your FastAPI application to replace the existing DatabaseManager
+
+import socket
+import pyodbc
+import logging
+import time
+import subprocess
+import sys
+from typing import Dict, Optional, Tuple
+
+class FixedDatabaseManager:
+    def __init__(self, config):
+        self.config = config
+        self.max_retries = 3
+        self.retry_delay = 5
+        self.logger = logging.getLogger(__name__)
+    
+    def _comprehensive_network_test(self) -> Tuple[bool, str]:
+        """Test network connectivity thoroughly"""
+        host = self.config['server']
+        port = self.config['port']
         
+        # Test 1: Basic ping
+        try:
+            if sys.platform.startswith('win'):
+                result = subprocess.run(['ping', '-n', '2', host], 
+                                      capture_output=True, text=True, timeout=15)
+            else:
+                result = subprocess.run(['ping', '-c', '2', host], 
+                                      capture_output=True, text=True, timeout=15)
+            
+            ping_success = result.returncode == 0
+            self.logger.info(f"Ping test: {'SUCCESS' if ping_success else 'FAILED'}")
+            
+        except Exception as e:
+            ping_success = False
+            self.logger.error(f"Ping failed: {e}")
+        
+        # Test 2: TCP connection with detailed error
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(15)
+            
+            start_time = time.time()
+            result = sock.connect_ex((host, port))
+            connection_time = time.time() - start_time
+            
+            sock.close()
+            
+            if result == 0:
+                self.logger.info(f"TCP connection SUCCESS (took {connection_time:.2f}s)")
+                return True, f"Network OK - Connection time: {connection_time:.2f}s"
+            else:
+                error_messages = {
+                    10060: "Connection timed out",
+                    10061: "Connection refused (service not running)",
+                    10065: "Host unreachable",
+                    10054: "Connection reset by peer",
+                    11001: "Host not found"
+                }
+                
+                error_msg = error_messages.get(result, f"Unknown error code {result}")
+                self.logger.error(f"TCP connection FAILED: {error_msg}")
+                return False, f"TCP connection failed: {error_msg}"
+                
+        except Exception as e:
+            self.logger.error(f"TCP test exception: {e}")
+            return False, f"TCP test failed: {str(e)}"
+    
+    def _test_connection_with_timeout(self, connection_string: str, timeout: int = 30) -> Optional[object]:
+        """Test connection with specific timeout"""
+        try:
+            self.logger.info(f"Testing connection with {timeout}s timeout...")
+            
+            connection = pyodbc.connect(connection_string, timeout=timeout)
+            
+            # Test with a simple query
+            cursor = connection.cursor()
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+            cursor.close()
+            
+            self.logger.info("✅ Connection test successful!")
+            return connection
+            
+        except pyodbc.Error as e:
+            error_code = e.args[0] if e.args else "Unknown"
+            error_message = e.args[1] if len(e.args) > 1 else str(e)
+            self.logger.error(f"Connection failed - Code: {error_code}, Message: {error_message}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Unexpected connection error: {e}")
+            return None
+    
+    def get_connection(self):
+        """Get connection with comprehensive error handling"""
+        
+        # Step 1: Network test
+        self.logger.info("=== DATABASE CONNECTION DIAGNOSIS ===")
+        network_ok, network_msg = self._comprehensive_network_test()
+        
+        if not network_ok:
+            error_msg = f"""
+            🚨 NETWORK CONNECTIVITY FAILED: {network_msg}
+            
+            TROUBLESHOOTING STEPS:
+            1. Check Radmin VPN Status:
+               - Is Radmin VPN running?
+               - Are you connected to the correct network?
+               - Can you ping other devices on the VPN network?
+            
+            2. Verify SQL Server:
+               - Is SQL Server running on 26.25.148.0?
+               - Is TCP/IP protocol enabled?
+               - Is port 1433 open?
+            
+            3. Check Firewall:
+               - Windows Firewall on both machines
+               - Antivirus firewall
+               - Router/network firewall
+            
+            4. Test from SQL Server Management Studio:
+               - Try connecting with the same credentials
+               - Server: 26.25.148.0,1433
+               - Authentication: SQL Server
+               - Username: sa
+               - Password: 123
+            """
+            
+            self.logger.error(error_msg)
+            raise Exception(f"Network connectivity failed: {network_msg}")
+        
+        self.logger.info(f"✅ Network connectivity OK: {network_msg}")
+        
+        # Step 2: Test different connection approaches
+        connection_variants = [
+            # Standard connection
+            (f"DRIVER={self.config['driver']};SERVER={self.config['server']},{self.config['port']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;", "Standard"),
+            
+            # Longer timeout
+            (f"DRIVER={self.config['driver']};SERVER={self.config['server']},{self.config['port']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=60;Login Timeout=60;", "Long timeout"),
+            
+            # Without explicit port
+            (f"DRIVER={self.config['driver']};SERVER={self.config['server']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;", "No port"),
+            
+            # Minimal connection string
+            (f"DRIVER={self.config['driver']};SERVER={self.config['server']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};", "Minimal"),
+        ]
+        
+        for connection_string, variant_name in connection_variants:
+            self.logger.info(f"Trying {variant_name} connection...")
+            
+            connection = self._test_connection_with_timeout(connection_string, 30)
+            if connection:
+                self.logger.info(f"✅ SUCCESS with {variant_name} connection!")
+                return connection
+        
+        # If all attempts failed
+        error_msg = """
+        ❌ ALL CONNECTION ATTEMPTS FAILED
+        
+        This indicates that while network connectivity exists, there's likely an issue with:
+        1. SQL Server authentication (check username/password)
+        2. Database permissions
+        3. SQL Server configuration
+        4. ODBC driver issues
+        
+        Please verify:
+        - SQL Server is accepting connections
+        - 'sa' account is enabled and password is correct
+        - SQL Server is configured for mixed mode authentication
+        - TCP/IP protocol is enabled in SQL Server Configuration Manager
+        """
+        
+        self.logger.error(error_msg)
+        raise Exception("Database connection failed after all attempts. Check SQL Server configuration.")
+
+# Update your FastAPI endpoint to use the fixed manager
+
+# Fixed database connection test endpoint
+@app.get("/test-db-fixed")
+async def test_database_connection_fixed():
+    """Enhanced database connection test with better diagnostics"""
+    try:
+        # Use the fixed database manager
+        fixed_db_manager = FixedDatabaseManager(SQL_SERVER_CONFIG)
+        
+        with fixed_db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get comprehensive server info with fixed SQL syntax
+            cursor.execute("""
+                SELECT 
+                    @@VERSION as server_version,
+                    DB_NAME() as database_name,
+                    GETDATE() as server_time,
+                    @@SERVERNAME as server_name,
+                    @@SERVICENAME as service_name
+            """)
+            
+            result = cursor.fetchone()
+            
+            # Test table operations
+            cursor.execute("""
+                SELECT COUNT(*) as table_count 
+                FROM INFORMATION_SCHEMA.TABLES 
+                WHERE TABLE_NAME = 'company_info'
+            """)
+            table_exists = cursor.fetchone()[0] > 0
+            
+            record_count = 0
+            if table_exists:
+                cursor.execute("SELECT COUNT(*) FROM company_info")
+                record_count = cursor.fetchone()[0]
+            
+            return {
+                "status": "success",
+                "message": "Database connection successful with enhanced diagnostics",
+                "server_info": {
+                    "version": result[0],
+                    "database": result[1],
+                    "server_time": str(result[2]),  # Changed from current_time to server_time
+                    "server_name": result[3],
+                    "service_name": result[4]
+                },
+                "table_info": {
+                    "company_info_exists": table_exists,
+                    "record_count": record_count
+                },
+                "connection_config": {
+                    "server": SQL_SERVER_CONFIG['server'],
+                    "port": SQL_SERVER_CONFIG['port'],
+                    "database": SQL_SERVER_CONFIG['database'],
+                    "username": SQL_SERVER_CONFIG['username']
+                }
+            }
+            
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "Database connection failed",
+            "error": str(e),
+            "troubleshooting": {
+                "check_radmin_vpn": "Ensure Radmin VPN is connected",
+                "check_sql_server": "Verify SQL Server is running on 26.25.148.0",
+                "check_firewall": "Check firewall settings",
+                "test_ssms": "Try connecting with SQL Server Management Studio"
+            }
+        }
+
+# Replace your existing DatabaseManager with FixedDatabaseManager in your main code
+# db_manager = FixedDatabaseManager(SQL_SERVER_CONFIG)
+#        
 def extract_text_pdfminer(pdf_path):
     """Trích xuất text từ PDF bằng pdfminer"""
     try:
