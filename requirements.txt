@@ -6,4 +6,4 @@ requests
 pyodbc
 python-dotenv
 supabase
-psycopg2
+psycopg2-binary
