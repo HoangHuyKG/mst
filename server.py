@@ -616,7 +616,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         
                         # Thử multiple selectors
                         selectors_to_try = [
-                            '#ctl00$C$ANNOUNCEMENT_TYPE_IDFilterFld',
+                            'ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld ',
                             'select[name*="ANNOUNCEMENT_TYPE"]',
                             'select[id*="ANNOUNCEMENT_TYPE"]'
                         ]
