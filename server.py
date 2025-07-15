@@ -14,6 +14,11 @@ import pyodbc
 from datetime import datetime
 import json
 from dotenv import load_dotenv
+from supabase import create_client, Client
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import psycopg2.pool
+import urllib.parse
 load_dotenv()  # Thêm dòng này sau các import
 
 # Cấu hình logging
@@ -27,17 +32,11 @@ CAPTCHA_API_KEY = os.environ.get('CAPTCHA_API_KEY', 'your_default_key')
 TARGET_URL = "https://dangkyquamang.dkkd.gov.vn/egazette/Forms/Egazette/ANNOUNCEMENTSListingInsUpd.aspx"
 SITE_KEY = "6LewYU4UAAAAAD9dQ51Cj_A_1uHLOXw9wJIxi9x0"
 
-SQL_SERVER_CONFIG = {
-    'server': '26.25.148.0',  # IP của Radmin VPN
-    'database': os.environ.get('SQL_DATABASE', 'CompanyDB'),
-    'username': os.environ.get('SQL_USERNAME', 'sa'),
-    'password': os.environ.get('SQL_PASSWORD', '123'),
-    'driver': '{ODBC Driver 17 for SQL Server}',
-    'port': int(os.environ.get('SQL_PORT', '1433')),
-    'timeout': 60,
-    'login_timeout': 60,
-    'encrypt': 'no',
-    'trust_server_certificate': 'yes'
+# Supabase Configuration - Sử dụng service_role key thay vì anon key
+SUPABASE_CONFIG = {
+    'url': os.environ.get('SUPABASE_URL', 'your_supabase_url'),
+    'key': os.environ.get('SUPABASE_SERVICE_ROLE_KEY', 'your_supabase_service_role_key'),  # Đổi từ anon key sang service_role key
+    'database_url': os.environ.get('SUPABASE_DB_URL', 'postgresql://postgres:[password]@db.[project-ref].supabase.co:5432/postgres')
 }
 
 class CaptchaSolver:
@@ -127,566 +126,170 @@ class CaptchaSolver:
 class DatabaseManager:
     def __init__(self, config):
         self.config = config
+        # Sử dụng service_role key để bypass RLS
+        self.supabase: Client = create_client(config['url'], config['key'])
         self.max_retries = 3
-        self.retry_delay = 5  # giây
-            
-    def _build_connection_string(self):
-        """Xây dựng connection string với nhiều tùy chọn"""
-        # Thử connection string đầy đủ
-        connection_string = (
-            f"DRIVER={self.config['driver']};"
-            f"SERVER={self.config['server']},{self.config['port']};"
-            f"DATABASE={self.config['database']};"
-            f"UID={self.config['username']};"
-            f"PWD={self.config['password']};"
-            f"Encrypt=no;"
-            f"TrustServerCertificate=yes;"
-            f"Connection Timeout={self.config['timeout']};"
-            f"Login Timeout={self.config.get('login_timeout', 60)};"
-            f"MultipleActiveResultSets=True;"
-            f"ApplicationIntent=ReadWrite;"
-        )
-        return connection_string
-    
-    def _test_connection(self):
-        """Test kết nối với server"""
-        import socket
-        try:
-            # Test TCP connection
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10)
-            result = sock.connect_ex((self.config['server'], self.config['port']))
-            sock.close()
-            
-            if result == 0:
-                logger.info(f"TCP connection to {self.config['server']}:{self.config['port']} successful")
-                return True
-            else:
-                logger.error(f"TCP connection failed to {self.config['server']}:{self.config['port']}")
-                return False
-        except Exception as e:
-            logger.error(f"Connection test failed: {e}")
-            return False
-    
+        self.retry_delay = 5
+        
     def get_connection(self):
-        """Tạo kết nối đến SQL Server với retry logic"""
-        last_error = None
-        
-        # Test TCP connection trước
-        if not self._test_connection():
-            raise Exception(f"Cannot reach SQL Server at {self.config['server']}:{self.config['port']}")
-        
-        for attempt in range(self.max_retries):
-            try:
-                logger.info(f"Attempting database connection {attempt + 1}/{self.max_retries}")
-                
-                connection_string = self._build_connection_string()
-                logger.info(f"Connection string: {connection_string.replace(self.config['password'], '***')}")
-                
-                connection = pyodbc.connect(
-                    connection_string,
-                    timeout=self.config['timeout'],
-                    autocommit=False
-                )
-                
-                # Test connection bằng cách thực hiện một query đơn giản
-                cursor = connection.cursor()
-                cursor.execute("SELECT 1")
-                cursor.fetchone()
-                cursor.close()
-                
-                logger.info("Database connection successful!")
-                return connection
-                
-            except pyodbc.Error as e:
-                last_error = e
-                error_code = e.args[0] if e.args else "Unknown"
-                error_message = e.args[1] if len(e.args) > 1 else str(e)
-                
-                logger.error(f"Database connection attempt {attempt + 1} failed:")
-                logger.error(f"Error Code: {error_code}")
-                logger.error(f"Error Message: {error_message}")
-                
-                # Nếu là lỗi timeout hoặc network, thử lại
-                if error_code in ['HYT00', '08001', '08S01'] and attempt < self.max_retries - 1:
-                    logger.info(f"Retrying in {self.retry_delay} seconds...")
-                    time.sleep(self.retry_delay)
-                    continue
-                else:
-                    break
-                    
-            except Exception as e:
-                last_error = e
-                logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
-                if attempt < self.max_retries - 1:
-                    logger.info(f"Retrying in {self.retry_delay} seconds...")
-                    time.sleep(self.retry_delay)
-                else:
-                    break
-        
-        # Nếu tất cả attempts đều thất bại
-        error_msg = f"Database connection failed after {self.max_retries} attempts. Last error: {last_error}"
-        logger.error(error_msg)
-        raise Exception(error_msg)
-    
-    def test_connection_variants(self):
-        """Test nhiều variant của connection string"""
-        variants = [
-            # Variant 1: Cơ bản với TCP
-            {
-                'name': 'TCP Connection',
-                'string': f"DRIVER={self.config['driver']};SERVER={self.config['server']},{self.config['port']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;"
-            },
-            # Variant 2: Không chỉ định port
-            {
-                'name': 'Default Port',
-                'string': f"DRIVER={self.config['driver']};SERVER={self.config['server']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;"
-            },
-            # Variant 3: Sử dụng IP với instance
-            {
-                'name': 'IP with Instance',
-                'string': f"DRIVER={self.config['driver']};SERVER={self.config['server']}\\SQLEXPRESS;DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;"
-            },
-            # Variant 4: Trusted connection (nếu có thể)
-            {
-                'name': 'Windows Authentication',
-                'string': f"DRIVER={self.config['driver']};SERVER={self.config['server']},{self.config['port']};DATABASE={self.config['database']};Trusted_Connection=yes;Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;"
-            }
-        ]
-        
-        for variant in variants:
-            try:
-                logger.info(f"Testing {variant['name']}...")
-                connection = pyodbc.connect(variant['string'], timeout=30)
-                cursor = connection.cursor()
-                cursor.execute("SELECT 1")
-                cursor.fetchone()
-                cursor.close()
-                connection.close()
-                logger.info(f"✓ {variant['name']} successful!")
-                return variant['string']
-            except Exception as e:
-                logger.error(f"✗ {variant['name']} failed: {e}")
-                continue
-        
-        return None
+        """Tạo kết nối PostgreSQL với connection string đã sửa"""
+        try:
+            # Sửa lại format connection string
+            conn = psycopg2.connect(
+                self.config['database_url'],
+                cursor_factory=RealDictCursor
+            )
+            conn.autocommit = False
+            return conn
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            raise
     
     def create_tables(self):
-        """Tạo bảng lưu trữ dữ liệu nếu chưa tồn tại"""
+        """Tạo bảng PostgreSQL với RLS disabled"""
         try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Tạo bảng company_info
-                create_table_query = """
-                IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='company_info' AND xtype='U')
-                CREATE TABLE company_info (
-                    id INT IDENTITY(1,1) PRIMARY KEY,
-                    keyword NVARCHAR(255) NOT NULL,
-                    tax_id NVARCHAR(50),
-                    company_name NVARCHAR(500),
-                    address NVARCHAR(1000),
-                    legal_representative NVARCHAR(255),
-                    start_date NVARCHAR(100),
-                    status NVARCHAR(255),
-                    company_type NVARCHAR(255),
-                    email NVARCHAR(255),
-                    phone NVARCHAR(50),
-                    raw_data NVARCHAR(MAX),
-                    created_at DATETIME DEFAULT GETDATE(),
-                    updated_at DATETIME DEFAULT GETDATE()
-                )
-                """
-                
-                cursor.execute(create_table_query)
-                conn.commit()
-                logger.info("Database tables created successfully")
+            # Sử dụng Supabase client với service_role key
+            # Hoặc tạo table trực tiếp trong Supabase Dashboard
+            
+            # Tạo table qua SQL (chạy trong Supabase SQL Editor)
+            sql_commands = """
+            -- Tạo table
+            CREATE TABLE IF NOT EXISTS company_info (
+                id SERIAL PRIMARY KEY,
+                keyword VARCHAR(255) NOT NULL,
+                tax_id VARCHAR(50),
+                company_name VARCHAR(500),
+                address VARCHAR(1000),
+                legal_representative VARCHAR(255),
+                start_date VARCHAR(100),
+                status VARCHAR(255),
+                company_type VARCHAR(255),
+                email VARCHAR(255),
+                phone VARCHAR(50),
+                raw_data JSONB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            -- Tắt RLS cho table này
+            ALTER TABLE company_info DISABLE ROW LEVEL SECURITY;
+            
+            -- Hoặc tạo policy cho phép tất cả operations
+            ALTER TABLE company_info ENABLE ROW LEVEL SECURITY;
+            
+            CREATE POLICY "Allow all operations on company_info" 
+            ON company_info FOR ALL 
+            TO authenticated, anon
+            USING (true) 
+            WITH CHECK (true);
+            """
+            
+            logger.info("Please run the following SQL commands in Supabase SQL Editor:")
+            logger.info(sql_commands)
+            
+            # Kiểm tra xem table đã tồn tại chưa
+            try:
+                result = self.supabase.table('company_info').select('id').limit(1).execute()
+                logger.info("Table company_info exists and accessible")
+                return True
+            except Exception as e:
+                logger.error(f"Table access test failed: {e}")
+                raise
                 
         except Exception as e:
             logger.error(f"Error creating tables: {e}")
             raise
     
     def save_company_info(self, keyword, tax_info, contact_info):
+        """Lưu dữ liệu vào Supabase với error handling tốt hơn"""
         try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Chuẩn bị dữ liệu
-                tax_data = tax_info or {}
-                contact_data = contact_info or {}
-                
-                # Xử lý logic ưu tiên phone
-                final_phone = None
-                phone_source = None
-                
-                if tax_data.get('phone'):
-                    # Ưu tiên phone từ masothue.com
-                    final_phone = tax_data.get('phone')
-                    phone_source = "masothue.com"
-                elif contact_data.get('phone'):
-                    # Fallback sang phone từ PDF
-                    final_phone = contact_data.get('phone')
-                    phone_source = "pdf"
-                
-                # Kiểm tra xem record đã tồn tại chưa
-                check_query = "SELECT id FROM company_info WHERE keyword = ? AND tax_id = ?"
-                cursor.execute(check_query, (keyword, tax_data.get('taxID')))
-                existing_record = cursor.fetchone()
-                
-                if existing_record:
-                    # Cập nhật record hiện tại
-                    update_query = """
-                    UPDATE company_info 
-                    SET company_name = ?, address = ?, legal_representative = ?, 
-                        start_date = ?, status = ?, company_type = ?, 
-                        email = ?, phone = ?, raw_data = ?, updated_at = GETDATE()
-                    WHERE id = ?
-                    """
-                    
-                    cursor.execute(update_query, (
-                        tax_data.get('companyName'),
-                        tax_data.get('address'),
-                        tax_data.get('legalRepresentative'),
-                        tax_data.get('startDate'),
-                        tax_data.get('status'),
-                        tax_data.get('companyType'),
-                        contact_data.get('email'),
-                        final_phone,  # Sử dụng phone đã được xử lý
-                        json.dumps({
-                            'tax_info': tax_data, 
-                            'contact_info': contact_data,
-                            'phone_source': phone_source,
-                            'final_phone': final_phone
-                        }, ensure_ascii=False),
-                        existing_record[0]
-                    ))
-                    
-                    logger.info(f"Updated existing record for keyword: {keyword}, phone source: {phone_source}")
-                    
-                else:
-                    # Thêm record mới
-                    insert_query = """
-                    INSERT INTO company_info 
-                    (keyword, tax_id, company_name, address, legal_representative, 
-                    start_date, status, company_type, email, phone, raw_data)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """
-                    
-                    cursor.execute(insert_query, (
-                        keyword,
-                        tax_data.get('taxID'),
-                        tax_data.get('companyName'),
-                        tax_data.get('address'),
-                        tax_data.get('legalRepresentative'),
-                        tax_data.get('startDate'),
-                        tax_data.get('status'),
-                        tax_data.get('companyType'),
-                        contact_data.get('email'),
-                        final_phone,  # Sử dụng phone đã được xử lý
-                        json.dumps({
-                            'tax_info': tax_data, 
-                            'contact_info': contact_data,
-                            'phone_source': phone_source,
-                            'final_phone': final_phone
-                        }, ensure_ascii=False)
-                    ))
-                    
-                    logger.info(f"Inserted new record for keyword: {keyword}, phone source: {phone_source}")
-                
-                conn.commit()
+            # Chuẩn bị dữ liệu
+            tax_data = tax_info or {}
+            contact_data = contact_info or {}
+            
+            # Logic phone priority
+            final_phone = None
+            phone_source = None
+            
+            if tax_data.get('phone'):
+                final_phone = tax_data.get('phone')
+                phone_source = "masothue.com"
+            elif contact_data.get('phone'):
+                final_phone = contact_data.get('phone')
+                phone_source = "pdf"
+            
+            # Chuẩn bị data cho insert/update
+            data = {
+                'keyword': keyword,
+                'tax_id': tax_data.get('taxID'),
+                'company_name': tax_data.get('companyName'),
+                'address': tax_data.get('address'),
+                'legal_representative': tax_data.get('legalRepresentative'),
+                'start_date': tax_data.get('startDate'),
+                'status': tax_data.get('status'),
+                'company_type': tax_data.get('companyType'),
+                'email': contact_data.get('email'),
+                'phone': final_phone,
+                'raw_data': {
+                    'tax_info': tax_data,
+                    'contact_info': contact_data,
+                    'phone_source': phone_source,
+                    'final_phone': final_phone
+                }
+            }
+            
+            # Thử insert trước, nếu fail thì update
+            try:
+                # Thử insert
+                result = self.supabase.table('company_info').insert(data).execute()
+                logger.info(f"Inserted new record for keyword: {keyword}")
                 return True
+                
+            except Exception as insert_error:
+                logger.info(f"Insert failed, trying update: {insert_error}")
+                
+                # Nếu insert fail, thử update
+                try:
+                    # Tìm record existing
+                    existing = self.supabase.table('company_info').select('id').eq('keyword', keyword).eq('tax_id', tax_data.get('taxID')).execute()
+                    
+                    if existing.data:
+                        # Update existing record
+                        data['updated_at'] = 'now()'
+                        result = self.supabase.table('company_info').update(data).eq('id', existing.data[0]['id']).execute()
+                        logger.info(f"Updated existing record for keyword: {keyword}")
+                        return True
+                    else:
+                        # Không tìm thấy record để update
+                        logger.error(f"No existing record found for update: {keyword}")
+                        return False
+                        
+                except Exception as update_error:
+                    logger.error(f"Update also failed: {update_error}")
+                    return False
                 
         except Exception as e:
             logger.error(f"Error saving company info: {e}")
             return False
     
     def get_company_info(self, keyword=None, tax_id=None):
-        """Lấy thông tin công ty từ database"""
+        """Lấy thông tin công ty"""
         try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                if keyword:
-                    query = "SELECT * FROM company_info WHERE keyword = ? ORDER BY created_at DESC"
-                    cursor.execute(query, (keyword,))
-                elif tax_id:
-                    query = "SELECT * FROM company_info WHERE tax_id = ? ORDER BY created_at DESC"
-                    cursor.execute(query, (tax_id,))
-                else:
-                    query = "SELECT * FROM company_info ORDER BY created_at DESC"
-                    cursor.execute(query)
-                
-                columns = [column[0] for column in cursor.description]
-                results = []
-                
-                for row in cursor.fetchall():
-                    row_dict = dict(zip(columns, row))
-                    # Parse raw_data JSON
-                    if row_dict.get('raw_data'):
-                        try:
-                            row_dict['raw_data'] = json.loads(row_dict['raw_data'])
-                        except:
-                            pass
-                    results.append(row_dict)
-                
-                return results
-                
+            query = self.supabase.table('company_info').select('*')
+            
+            if keyword:
+                query = query.eq('keyword', keyword)
+            elif tax_id:
+                query = query.eq('tax_id', tax_id)
+            
+            result = query.order('created_at', desc=True).execute()
+            
+            return result.data if result.data else []
+            
         except Exception as e:
             logger.error(f"Error getting company info: {e}")
             return []
-# Add this to your FastAPI application to replace the existing DatabaseManager
-
-import socket
-import pyodbc
-import logging
-import time
-import subprocess
-import sys
-from typing import Dict, Optional, Tuple
-
-class FixedDatabaseManager:
-    def __init__(self, config):
-        self.config = config
-        self.max_retries = 3
-        self.retry_delay = 5
-        self.logger = logging.getLogger(__name__)
-    
-    def _comprehensive_network_test(self) -> Tuple[bool, str]:
-        """Test network connectivity thoroughly"""
-        host = self.config['server']
-        port = self.config['port']
         
-        # Test 1: Basic ping
-        try:
-            if sys.platform.startswith('win'):
-                result = subprocess.run(['ping', '-n', '2', host], 
-                                      capture_output=True, text=True, timeout=15)
-            else:
-                result = subprocess.run(['ping', '-c', '2', host], 
-                                      capture_output=True, text=True, timeout=15)
-            
-            ping_success = result.returncode == 0
-            self.logger.info(f"Ping test: {'SUCCESS' if ping_success else 'FAILED'}")
-            
-        except Exception as e:
-            ping_success = False
-            self.logger.error(f"Ping failed: {e}")
-        
-        # Test 2: TCP connection with detailed error
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(15)
-            
-            start_time = time.time()
-            result = sock.connect_ex((host, port))
-            connection_time = time.time() - start_time
-            
-            sock.close()
-            
-            if result == 0:
-                self.logger.info(f"TCP connection SUCCESS (took {connection_time:.2f}s)")
-                return True, f"Network OK - Connection time: {connection_time:.2f}s"
-            else:
-                error_messages = {
-                    10060: "Connection timed out",
-                    10061: "Connection refused (service not running)",
-                    10065: "Host unreachable",
-                    10054: "Connection reset by peer",
-                    11001: "Host not found"
-                }
-                
-                error_msg = error_messages.get(result, f"Unknown error code {result}")
-                self.logger.error(f"TCP connection FAILED: {error_msg}")
-                return False, f"TCP connection failed: {error_msg}"
-                
-        except Exception as e:
-            self.logger.error(f"TCP test exception: {e}")
-            return False, f"TCP test failed: {str(e)}"
-    
-    def _test_connection_with_timeout(self, connection_string: str, timeout: int = 30) -> Optional[object]:
-        """Test connection with specific timeout"""
-        try:
-            self.logger.info(f"Testing connection with {timeout}s timeout...")
-            
-            connection = pyodbc.connect(connection_string, timeout=timeout)
-            
-            # Test with a simple query
-            cursor = connection.cursor()
-            cursor.execute("SELECT 1")
-            cursor.fetchone()
-            cursor.close()
-            
-            self.logger.info("✅ Connection test successful!")
-            return connection
-            
-        except pyodbc.Error as e:
-            error_code = e.args[0] if e.args else "Unknown"
-            error_message = e.args[1] if len(e.args) > 1 else str(e)
-            self.logger.error(f"Connection failed - Code: {error_code}, Message: {error_message}")
-            return None
-        except Exception as e:
-            self.logger.error(f"Unexpected connection error: {e}")
-            return None
-    
-    def get_connection(self):
-        """Get connection with comprehensive error handling"""
-        
-        # Step 1: Network test
-        self.logger.info("=== DATABASE CONNECTION DIAGNOSIS ===")
-        network_ok, network_msg = self._comprehensive_network_test()
-        
-        if not network_ok:
-            error_msg = f"""
-            🚨 NETWORK CONNECTIVITY FAILED: {network_msg}
-            
-            TROUBLESHOOTING STEPS:
-            1. Check Radmin VPN Status:
-               - Is Radmin VPN running?
-               - Are you connected to the correct network?
-               - Can you ping other devices on the VPN network?
-            
-            2. Verify SQL Server:
-               - Is SQL Server running on 26.25.148.0?
-               - Is TCP/IP protocol enabled?
-               - Is port 1433 open?
-            
-            3. Check Firewall:
-               - Windows Firewall on both machines
-               - Antivirus firewall
-               - Router/network firewall
-            
-            4. Test from SQL Server Management Studio:
-               - Try connecting with the same credentials
-               - Server: 26.25.148.0,1433
-               - Authentication: SQL Server
-               - Username: sa
-               - Password: 123
-            """
-            
-            self.logger.error(error_msg)
-            raise Exception(f"Network connectivity failed: {network_msg}")
-        
-        self.logger.info(f"✅ Network connectivity OK: {network_msg}")
-        
-        # Step 2: Test different connection approaches
-        connection_variants = [
-            # Standard connection
-            (f"DRIVER={self.config['driver']};SERVER={self.config['server']},{self.config['port']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;", "Standard"),
-            
-            # Longer timeout
-            (f"DRIVER={self.config['driver']};SERVER={self.config['server']},{self.config['port']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=60;Login Timeout=60;", "Long timeout"),
-            
-            # Without explicit port
-            (f"DRIVER={self.config['driver']};SERVER={self.config['server']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};Encrypt=no;TrustServerCertificate=yes;Connection Timeout=30;", "No port"),
-            
-            # Minimal connection string
-            (f"DRIVER={self.config['driver']};SERVER={self.config['server']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']};", "Minimal"),
-        ]
-        
-        for connection_string, variant_name in connection_variants:
-            self.logger.info(f"Trying {variant_name} connection...")
-            
-            connection = self._test_connection_with_timeout(connection_string, 30)
-            if connection:
-                self.logger.info(f"✅ SUCCESS with {variant_name} connection!")
-                return connection
-        
-        # If all attempts failed
-        error_msg = """
-        ❌ ALL CONNECTION ATTEMPTS FAILED
-        
-        This indicates that while network connectivity exists, there's likely an issue with:
-        1. SQL Server authentication (check username/password)
-        2. Database permissions
-        3. SQL Server configuration
-        4. ODBC driver issues
-        
-        Please verify:
-        - SQL Server is accepting connections
-        - 'sa' account is enabled and password is correct
-        - SQL Server is configured for mixed mode authentication
-        - TCP/IP protocol is enabled in SQL Server Configuration Manager
-        """
-        
-        self.logger.error(error_msg)
-        raise Exception("Database connection failed after all attempts. Check SQL Server configuration.")
-
-# Update your FastAPI endpoint to use the fixed manager
-
-# Fixed database connection test endpoint
-@app.get("/test-db-fixed")
-async def test_database_connection_fixed():
-    """Enhanced database connection test with better diagnostics"""
-    try:
-        # Use the fixed database manager
-        fixed_db_manager = FixedDatabaseManager(SQL_SERVER_CONFIG)
-        
-        with fixed_db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Get comprehensive server info with fixed SQL syntax
-            cursor.execute("""
-                SELECT 
-                    @@VERSION as server_version,
-                    DB_NAME() as database_name,
-                    GETDATE() as server_time,
-                    @@SERVERNAME as server_name,
-                    @@SERVICENAME as service_name
-            """)
-            
-            result = cursor.fetchone()
-            
-            # Test table operations
-            cursor.execute("""
-                SELECT COUNT(*) as table_count 
-                FROM INFORMATION_SCHEMA.TABLES 
-                WHERE TABLE_NAME = 'company_info'
-            """)
-            table_exists = cursor.fetchone()[0] > 0
-            
-            record_count = 0
-            if table_exists:
-                cursor.execute("SELECT COUNT(*) FROM company_info")
-                record_count = cursor.fetchone()[0]
-            
-            return {
-                "status": "success",
-                "message": "Database connection successful with enhanced diagnostics",
-                "server_info": {
-                    "version": result[0],
-                    "database": result[1],
-                    "server_time": str(result[2]),  # Changed from current_time to server_time
-                    "server_name": result[3],
-                    "service_name": result[4]
-                },
-                "table_info": {
-                    "company_info_exists": table_exists,
-                    "record_count": record_count
-                },
-                "connection_config": {
-                    "server": SQL_SERVER_CONFIG['server'],
-                    "port": SQL_SERVER_CONFIG['port'],
-                    "database": SQL_SERVER_CONFIG['database'],
-                    "username": SQL_SERVER_CONFIG['username']
-                }
-            }
-            
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": "Database connection failed",
-            "error": str(e),
-            "troubleshooting": {
-                "check_radmin_vpn": "Ensure Radmin VPN is connected",
-                "check_sql_server": "Verify SQL Server is running on 26.25.148.0",
-                "check_firewall": "Check firewall settings",
-                "test_ssms": "Try connecting with SQL Server Management Studio"
-            }
-        }
-
-# Replace your existing DatabaseManager with FixedDatabaseManager in your main code
-# db_manager = FixedDatabaseManager(SQL_SERVER_CONFIG)
-#        
 def extract_text_pdfminer(pdf_path):
     """Trích xuất text từ PDF bằng pdfminer"""
     try:
@@ -738,44 +341,88 @@ def clean_text(text):
     return text.strip()
 
 
+
 def extract_contact_info(text):
     """Trích xuất chỉ email và điện thoại từ text"""
     if not text:
         return {}
     
     info = {}
+    
+    # Làm sạch text trước khi xử lý
     text = re.sub(r'\s+', ' ', text)
     
-    # Trích xuất mã số doanh nghiệp
+    # Trích xuất mã số doanh nghiệp để tránh nhầm lẫn với số điện thoại
     tax_code = ""
-    for pattern in [r'Mã số doanh nghiệp:\s*(\d{10})', r'Mã số doanh nghiệp\s*(\d{10})', r'(?:^|\s)(\d{10})(?=\s|$)']:
+    tax_patterns = [
+        r'Mã số doanh nghiệp:\s*(\d{10})',
+        r'Mã số doanh nghiệp\s*(\d{10})',
+        r'(?:^|\s)(\d{10})(?=\s|$)'
+    ]
+    
+    for pattern in tax_patterns:
         match = re.search(pattern, text, re.MULTILINE)
         if match:
             tax_code = match.group(1)
             break
     
-    # Trích xuất điện thoại
+    # 1. Trích xuất điện thoại - Lấy số điện thoại xuất hiện đầu tiên
+    # Tạo pattern tổng hợp để tìm tất cả số điện thoại có thể
     phone_pattern = r'(?:Điện thoại:\s*|Tel:\s*|Phone:\s*)?(\d{2,4}[\.\-\s]?\d{3,4}[\.\-\s]?\d{3,4}[\.\-\s]?\d{0,4}|\d{9,11})'
-    valid_prefixes = ['01', '02', '03', '05', '07', '08', '09', '024', '028', '0236', '0256', '0274', '0204', '84']
     
-    for match in sorted(re.finditer(phone_pattern, text, re.MULTILINE | re.IGNORECASE), key=lambda x: x.start()):
-        phone = match.group(1)
+    # Tìm tất cả match với vị trí xuất hiện
+    phone_matches = []
+    for match in re.finditer(phone_pattern, text, re.MULTILINE | re.IGNORECASE):
+        phone_candidate = match.group(1)
+        position = match.start()
+        phone_matches.append((position, phone_candidate))
+    
+    # Sắp xếp theo vị trí xuất hiện
+    phone_matches.sort(key=lambda x: x[0])
+    
+    # Kiểm tra từng số theo thứ tự xuất hiện
+    for position, phone in phone_matches:
         clean_phone = re.sub(r'[\.\-\s]', '', phone)
         
-        # Tránh nhầm với mã số thuế
-        if clean_phone == tax_code or (tax_code and (clean_phone.startswith(tax_code) or tax_code.startswith(clean_phone))):
+        # Tránh nhầm lẫn với mã số thuế
+        if clean_phone == tax_code:
             continue
-        
+
+        if tax_code and (clean_phone.startswith(tax_code) or tax_code.startswith(clean_phone)):
+            continue
+
         # Kiểm tra độ dài và prefix hợp lệ
-        if 9 <= len(clean_phone) <= 11:
-            if any(clean_phone.startswith(prefix) for prefix in valid_prefixes) or (clean_phone.startswith('0') and len(clean_phone) in [10, 11]):
+        if len(clean_phone) >= 9 and len(clean_phone) <= 11:
+            # Kiểm tra các đầu số hợp lệ của Việt Nam
+            valid_prefixes = [
+                '01', '02', '03', '05', '07', '08', '09',  # Di động
+                '024', '028', '0236', '0256', '0274', '0204',  # Cố định
+                '84'  # Mã quốc gia
+            ]
+            
+            # Kiểm tra xem số có bắt đầu bằng prefix hợp lệ không
+            is_valid = False
+            for prefix in valid_prefixes:
+                if clean_phone.startswith(prefix):
+                    is_valid = True
+                    break
+            
+            # Hoặc kiểm tra nếu là số cố định bắt đầu bằng 0 và có 10-11 chữ số
+            if not is_valid and clean_phone.startswith('0') and len(clean_phone) in [10, 11]:
+                is_valid = True
+            
+            if is_valid:
                 info['phone'] = phone
                 break
     
-    # Trích xuất email
-    for pattern in [r'Email:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', 
-                   r'Email\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', 
-                   r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})']:
+    # 2. Trích xuất email
+    email_patterns = [
+        r'Email:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+        r'Email\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+        r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
+    ]
+    
+    for pattern in email_patterns:
         matches = re.findall(pattern, text)
         if matches:
             for email in matches:
@@ -786,6 +433,7 @@ def extract_contact_info(text):
                 break
     
     return info
+
 
 
 
@@ -816,7 +464,7 @@ def extract_pdf_contact_info(pdf_path):
         return None
 
 solver = CaptchaSolver(CAPTCHA_API_KEY)
-db_manager = DatabaseManager(SQL_SERVER_CONFIG)
+db_manager = DatabaseManager(SUPABASE_CONFIG)
 
 async def inject_captcha_response(page, captcha_code):
     """Inject captcha response safely"""
@@ -848,171 +496,383 @@ async def inject_captcha_response(page, captcha_code):
         return False
 
 async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
-    """Fixed crawl function with correct Playwright syntax"""
-    registration_types = [('NEW', 'Đăng ký mới'), ('AMEND', 'Đăng ký thay đổi')]
+    """Enhanced crawl function with navigation retry and early exit"""
+    browser = None
+    
+    # Danh sách các loại đăng ký để thử theo thứ tự
+    registration_types = [
+        ('NEW', 'Đăng ký mới'),
+        ('AMEND', 'Đăng ký thay đổi')
+    ]
+    
+    # Biến đếm số lần thử truy cập trang
+    navigation_attempts = 0
+    max_navigation_attempts = 3
     
     for attempt in range(max_retries):
-        browser = None
         try:
             logger.info(f"Attempt {attempt + 1}/{max_retries} for MST: {mst}")
             
             async with async_playwright() as p:
                 # Cấu hình browser
                 browser = await p.chromium.launch(
-                    headless=True,
-                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', 
-                          '--disable-blink-features=AutomationControlled', '--disable-web-security',
-                          '--disable-features=VizDisplayCompositor',
-                          '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36']
+                    headless=False,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-web-security',
+                        '--disable-features=VizDisplayCompositor',
+                        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    ],
+                    ignore_default_args=['--disable-extensions']
                 )
                 
                 context = await browser.new_context(
                     viewport={'width': 1366, 'height': 768},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                     extra_http_headers={
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                         'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
-                        'Connection': 'keep-alive'
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1'
                     },
-                    ignore_https_errors=True, java_script_enabled=True, bypass_csp=True
+                    ignore_https_errors=True,
+                    java_script_enabled=True,
+                    bypass_csp=True
                 )
                 
-                context.set_default_timeout(180000)
-                await context.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
+                # Set timeout cho context sau khi tạo
+                context.set_default_timeout(180000)  # 3 phút
+                
+                # Chặn tài nguyên không cần thiết
+                await context.route("**/*", lambda route: (
+                    route.abort() if route.request.resource_type in ["image", "media", "font"] 
+                    else route.continue_()
+                ))
                 
                 page = await context.new_page()
                 page.set_default_timeout(180000)
-                page.on("pageerror", lambda error: logger.error(f"Page error: {error}"))
-                page.on("console", lambda msg: logger.info(f"Console: {msg.text}"))
+                
+                # Thêm error handlers
+                async def handle_page_error(error):
+                    logger.error(f"Page error: {error}")
+
+                async def handle_console(msg):
+                    if msg.type == "error" and any(err in msg.text for err in ["net::ERR_FAILED", "net::ERR_ABORTED", "net::ERR_BLOCKED_BY_CLIENT"]):
+                        return
+                    if msg.type == "error":
+                        logger.info(f"Console: {msg.text}")
+
+                page.on("pageerror", handle_page_error)
+                page.on("console", handle_console)
+                
+                # Step 1: Navigate với retry logic và early exit
+                logger.info(f"Navigating to target URL for MST: {mst}")
+                
+                navigation_success = False
+                for nav_attempt in range(max_navigation_attempts):
+                    navigation_attempts += 1
+                    
+                    try:
+                        logger.info(f"Navigation attempt {nav_attempt + 1}/{max_navigation_attempts} (Total: {navigation_attempts})")
+                        
+                        # Thử truy cập trang
+                        response = await page.goto(
+                            TARGET_URL, 
+                            timeout=180000, 
+                            wait_until='networkidle'
+                        )
+                        
+                        # Kiểm tra response status
+                        if response and response.status >= 400:
+                            logger.error(f"HTTP error: {response.status}")
+                            raise Exception(f"HTTP {response.status} error")
+                        
+                        logger.info(f"Successfully navigated to target URL. Status: {response.status if response else 'Unknown'}")
+                        
+                        # Đợi một chút để trang stable
+                        await page.wait_for_timeout(5000)
+                        navigation_success = True
+                        break
+                        
+                    except Exception as nav_error:
+                        logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
+                        
+                        # Nếu đã thử đủ 3 lần navigation, dừng hoàn toàn
+                        if navigation_attempts >= max_navigation_attempts:
+                            logger.error(f"Failed to access dangkyquamang after {max_navigation_attempts} attempts. Stopping completely.")
+                            return None
+                        
+                        # Nếu chưa đủ 3 lần nhưng đã hết lần thử cho attempt này
+                        if nav_attempt == max_navigation_attempts - 1:
+                            logger.error(f"Navigation failed for attempt {attempt + 1}")
+                            raise nav_error
+                        
+                        await asyncio.sleep(3)
+                
+                # Nếu navigation không thành công, skip attempt này
+                if not navigation_success:
+                    logger.error(f"Navigation failed for attempt {attempt + 1}")
+                    continue
                 
                 # Thử từng loại đăng ký
                 for reg_type, reg_name in registration_types:
                     logger.info(f"Trying registration type: {reg_name} ({reg_type})")
                     
                     try:
-                        # Navigate với retry
-                        for nav_attempt in range(3):
-                            try:
-                                response = await page.goto(TARGET_URL, timeout=180000, wait_until='networkidle')
-                                if response and response.status >= 400:
-                                    raise Exception(f"HTTP {response.status} error")
-                                await page.wait_for_timeout(5000)
-                                break
-                            except Exception as nav_error:
-                                if nav_attempt == 2:
-                                    raise nav_error
-                                await asyncio.sleep(3)
+                        # Step 2: Wait for form elements
+                        logger.info("Waiting for form elements...")
                         
-                        # Wait for form elements
-                        selectors = ['#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', 'select[name*="ANNOUNCEMENT_TYPE"]', 'select[id*="ANNOUNCEMENT_TYPE"]']
+                        # Thử multiple selectors
+                        selectors_to_try = [
+                            '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld',
+                            'select[name*="ANNOUNCEMENT_TYPE"]',
+                            'select[id*="ANNOUNCEMENT_TYPE"]'
+                        ]
+                        
                         form_found = False
-                        for selector in selectors:
+                        for selector in selectors_to_try:
                             try:
                                 await page.wait_for_selector(selector, timeout=30000)
+                                logger.info(f"Found form element with selector: {selector}")
                                 form_found = True
                                 break
-                            except:
+                            except Exception as e:
+                                logger.warning(f"Selector {selector} not found: {e}")
                                 continue
                         
                         if not form_found:
+                            # Debug: In ra HTML của trang
+                            page_content = await page.content()
+                            logger.error("Form not found. Page content preview:")
+                            logger.error(page_content[:1000] + "...")
                             raise Exception("Form elements not found on page")
                         
-                        # Fill form
-                        await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', reg_type)
-                        await page.wait_for_timeout(3000)
-                        await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
-                        await page.wait_for_timeout(2000)
+                        # Step 3: Fill form
+                        logger.info(f"Filling form with registration type: {reg_name}")
                         
-                        # Solve captcha
+                        try:
+                            await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', reg_type)
+                            await page.wait_for_timeout(3000)
+                            
+                            await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
+                            await page.wait_for_timeout(2000)
+                            
+                            logger.info("Form filled successfully")
+                            
+                        except Exception as form_error:
+                            logger.error(f"Form filling failed: {form_error}")
+                            
+                            # Debug: Kiểm tra các elements có tồn tại không
+                            elements_info = await page.evaluate("""
+                                () => {
+                                    const info = {};
+                                    const typeSelect = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
+                                    const codeInput = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
+                                    
+                                    info.typeSelectExists = !!typeSelect;
+                                    info.codeInputExists = !!codeInput;
+                                    
+                                    if (typeSelect) {
+                                        info.typeSelectOptions = Array.from(typeSelect.options).map(opt => opt.value);
+                                    }
+                                    
+                                    return info;
+                                }
+                            """)
+                            
+                            logger.error(f"Form elements info: {elements_info}")
+                            raise form_error
+                        
+                        # Step 4: Solve captcha
+                        logger.info("Solving captcha...")
                         captcha_code = None
+                        
                         for captcha_attempt in range(2):
                             try:
                                 captcha_code = await asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL)
+                                logger.info("Captcha solved successfully")
                                 break
                             except Exception as captcha_error:
+                                logger.warning(f"Captcha attempt {captcha_attempt + 1} failed: {captcha_error}")
                                 if captcha_attempt == 1:
                                     raise captcha_error
                                 await asyncio.sleep(5)
                         
-                        if not captcha_code or not await inject_captcha_response(page, captcha_code):
-                            raise Exception("Failed to solve/inject captcha")
+                        if not captcha_code:
+                            raise Exception("Failed to solve captcha")
+                        
+                        # Step 5: Inject captcha
+                        success = await inject_captcha_response(page, captcha_code)
+                        if not success:
+                            raise Exception("Failed to inject captcha response")
                         
                         await page.wait_for_timeout(3000)
                         
-                        # Submit form
-                        await page.click('#ctl00_C_BtnFilter')
+                        # Step 6: Submit form
+                        logger.info("Submitting form...")
+                        
+                        try:
+                            await page.click('#ctl00_C_BtnFilter')
+                            logger.info("Form submitted successfully")
+                        except Exception as submit_error:
+                            logger.error(f"Form submission failed: {submit_error}")
+                            raise submit_error
+                        
+                        # Step 7: Wait for results
+                        logger.info("Waiting for results...")
+                        
                         await page.wait_for_load_state('networkidle', timeout=120000)
                         
-                        # Check for results
+                        # Check for results table
                         try:
                             await page.wait_for_selector('#ctl00_C_CtlList', timeout=45000)
-                        except:
-                            # Check for no results
-                            no_results_selectors = ['text=Không tìm thấy dữ liệu', 'text=No data found', '.no-results', '[id*="NoData"]']
-                            for selector in no_results_selectors:
-                                try:
-                                    await page.wait_for_selector(selector, timeout=5000)
-                                    logger.info(f"No results found for {reg_name}")
-                                    break
-                                except:
-                                    continue
-                            else:
-                                raise Exception("Results table not found")
-                            continue
+                            logger.info("Results table found")
+                        except Exception:
+                            # Check for no results message
+                            try:
+                                no_results_selectors = [
+                                    'text=Không tìm thấy dữ liệu',
+                                    'text=No data found',
+                                    '.no-results',
+                                    '[id*="NoData"]'
+                                ]
+                                
+                                for selector in no_results_selectors:
+                                    try:
+                                        await page.wait_for_selector(selector, timeout=5000)
+                                        logger.info(f"No results found with selector: {selector} for {reg_name}")
+                                        break
+                                    except:
+                                        continue
+                                else:
+                                    logger.error("Results table not found within timeout")
+                                    
+                                    # Debug: Lấy thông tin trang sau khi submit
+                                    current_url = page.url
+                                    page_title = await page.title()
+                                    logger.error(f"Current URL: {current_url}")
+                                    logger.error(f"Page title: {page_title}")
+                                    
+                                    # Lưu screenshot để debug
+                                    try:
+                                        await page.screenshot(path=f"debug_{mst}_{reg_type}_{attempt}.png")
+                                        logger.info(f"Screenshot saved: debug_{mst}_{reg_type}_{attempt}.png")
+                                    except:
+                                        pass
+                                    
+                                    raise Exception("Results table not found")
+                                
+                                # Nếu không có kết quả, thử loại đăng ký tiếp theo
+                                logger.info(f"No results found for {reg_name}, trying next registration type...")
+                                continue
+                            except:
+                                pass
                         
-                        # Find PDF button
-                        pdf_selectors = ['input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]', 'a[href*="pdf"]', 'input[value*="PDF"]', 'button[onclick*="pdf"]']
+                        # Step 8: Find and download PDF
+                        logger.info("Looking for PDF download button...")
+                        
+                        # Thử multiple selectors cho PDF button
+                        pdf_selectors = [
+                            'input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]',
+                            'a[href*="pdf"]',
+                            'input[value*="PDF"]',
+                            'button[onclick*="pdf"]'
+                        ]
+                        
                         pdf_button = None
                         for selector in pdf_selectors:
                             try:
                                 pdf_button = await page.query_selector(selector)
                                 if pdf_button:
+                                    logger.info(f"Found PDF button with selector: {selector}")
                                     break
-                            except:
+                            except Exception as e:
+                                logger.warning(f"PDF selector {selector} failed: {e}")
                                 continue
                         
                         if not pdf_button:
+                            logger.info(f"No PDF button found for {reg_name}")
+                            # Nếu là loại đăng ký cuối cùng, return None
                             if reg_type == registration_types[-1][0]:
+                                logger.info("No PDF found in any registration type")
                                 return None
-                            continue
+                            else:
+                                # Thử loại đăng ký tiếp theo
+                                logger.info(f"Trying next registration type...")
+                                continue
                         
-                        # Download PDF
+                        # Step 9: Download PDF
+                        logger.info(f"Downloading PDF for {reg_name}...")
+                        
                         file_name = f"{mst}_{reg_type}_{uuid.uuid4().hex[:8]}.pdf"
                         download_path = os.path.join(os.getcwd(), file_name)
                         
                         try:
                             async with page.expect_download(timeout=120000) as download_info:
                                 await pdf_button.click()
+                                logger.info("Clicked PDF download button")
                             
                             download = await download_info.value
                             await download.save_as(download_path)
+                            logger.info(f"PDF downloaded successfully: {file_name}")
                             
+                            # Verify file exists and has content
                             if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
+                                logger.info(f"PDF file verified: {os.path.getsize(download_path)} bytes")
                                 logger.info(f"Successfully downloaded PDF from {reg_name}")
                                 return file_name
                             else:
-                                if reg_type == registration_types[-1][0]:
+                                logger.error("Downloaded PDF file is empty or doesn't exist")
+                                # Nếu file rỗng, thử loại đăng ký tiếp theo
+                                if reg_type != registration_types[-1][0]:
+                                    logger.info("Empty PDF, trying next registration type...")
+                                    continue
+                                else:
                                     return None
-                                continue
-                                
+                            
                         except Exception as download_error:
-                            if reg_type == registration_types[-1][0]:
+                            logger.error(f"Download failed for {reg_name}: {download_error}")
+                            # Nếu download fail và không phải loại cuối cùng, thử loại tiếp theo
+                            if reg_type != registration_types[-1][0]:
+                                logger.info("Download failed, trying next registration type...")
+                                continue
+                            else:
                                 raise Exception(f"PDF download failed for all registration types. Last error: {download_error}")
-                            continue
                     
                     except Exception as reg_error:
-                        if reg_type == registration_types[-1][0]:
+                        logger.error(f"Registration type {reg_name} failed: {reg_error}")
+                        # Nếu không phải loại cuối cùng, thử loại tiếp theo
+                        if reg_type != registration_types[-1][0]:
+                            logger.info("Current registration type failed, trying next...")
+                            continue
+                        else:
+                            # Nếu là loại cuối cùng, raise error
                             raise reg_error
-                        continue
                 
+                # Nếu đã thử hết tất cả các loại đăng ký mà không thành công
+                logger.error("All registration types failed")
                 return None
                 
         except Exception as e:
             logger.error(f"Attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:
-                raise Exception(f"All {max_retries} attempts failed. Last error: {e}")
             
-            await asyncio.sleep(2 ** attempt)
+            # Nếu đã thử đủ 3 lần navigation, dừng hoàn toàn
+            if navigation_attempts >= max_navigation_attempts:
+                logger.error(f"Stopped after {max_navigation_attempts} navigation attempts")
+                return None
+            
+            if attempt == max_retries - 1:
+                logger.error(f"All {max_retries} attempts failed. Last error: {e}")
+                return None
+            
+            # Wait before retry
+            wait_time = 2 ** attempt
+            logger.info(f"Waiting {wait_time} seconds before retry...")
+            await asyncio.sleep(wait_time)
             
         finally:
             if browser:
@@ -1020,18 +880,28 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                     await browser.close()
                 except:
                     pass
+    
+    return None
 
 
 @app.get("/tax-info")
 async def get_tax_info_api(keyword: str = Query(..., min_length=1, description="Keyword to search for tax information")):
-    """API endpoint để scrape thông tin thuế từ masothue.com"""
+    """
+    API endpoint để scrape thông tin thuế từ masothue.com
+    """
     browser = None
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', 
-                      '--disable-images', '--disable-extensions', '--disable-plugins']
+                args=[
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-images',
+                    '--disable-extensions',
+                    '--disable-plugins'
+                ]
             )
             
             context = await browser.new_context(
@@ -1040,49 +910,72 @@ async def get_tax_info_api(keyword: str = Query(..., min_length=1, description="
             )
             
             page = await context.new_page()
+            
+            # Chặn tài nguyên không cần thiết
             await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
             
             logger.info(f"Navigating to masothue.com for keyword: {keyword}")
             
-            # Truy cập và tìm kiếm
+            # Truy cập trang web
             await page.goto('https://masothue.com', timeout=60000)
+            await page.wait_for_load_state('domcontentloaded')
+            
+            # Đợi input search xuất hiện
             await page.wait_for_selector('input[name="q"]', timeout=60000)
+            
+            # Nhập keyword và tìm kiếm
             await page.fill('input[name="q"]', keyword)
+            
+            # Click nút tìm kiếm và đợi navigation
             await page.click('.btn-search-submit')
+            await page.wait_for_load_state('domcontentloaded')
+            
+            # Đợi bảng kết quả tải xong
             await page.wait_for_selector('table.table-taxinfo tbody', timeout=60000)
             
             # Trích xuất dữ liệu
             result = await page.evaluate("""
                 () => {
                     const result = {};
+                    
+                    // Lấy tên công ty từ header
                     const companyNameHeader = document.querySelector('table.table-taxinfo thead th[itemprop="name"] .copy');
                     if (companyNameHeader) {
                         result.companyName = companyNameHeader.getAttribute('title') || companyNameHeader.innerText.trim();
                     }
                     
-                    const labelMap = {
-                        'Mã số thuế': 'taxID',
-                        'Địa chỉ': 'address', 
-                        'Người đại diện': 'legalRepresentative',
-                        'Ngày hoạt động': 'startDate',
-                        'Tình trạng': 'status',
-                        'Loại hình DN': 'companyType'
-                    };
+                    // Lấy các thông tin từ tbody
+                    const rows = Array.from(document.querySelectorAll('table.table-taxinfo tbody tr'));
                     
-                    Array.from(document.querySelectorAll('table.table-taxinfo tbody tr')).forEach(row => {
+                    rows.forEach(row => {
                         const label = row.querySelector('td:first-child')?.innerText.trim();
                         const valueCell = row.querySelector('td:nth-child(2)');
                         if (!label || !valueCell) return;
                         
                         let value = valueCell.innerText.trim();
+                        
+                        // Xử lý trường hợp người đại diện - lấy tên từ thẻ a hoặc span
                         if (label.includes('Người đại diện')) {
                             const nameElement = valueCell.querySelector('[itemprop="name"]');
-                            if (nameElement) value = nameElement.innerText.trim();
+                            if (nameElement) {
+                                value = nameElement.innerText.trim();
+                            }
                         }
                         
-                        Object.keys(labelMap).forEach(key => {
-                            if (label.includes(key)) result[labelMap[key]] = value;
-                        });
+                        // Mapping chỉ các trường cần thiết
+                        if (label.includes('Mã số thuế')) {
+                            result.taxID = value;
+                        } else if (label.includes('Địa chỉ')) {
+                            result.address = value;
+                        } else if (label.includes('Người đại diện')) {
+                            result.legalRepresentative = value;
+                        } else if (label.includes('Ngày hoạt động')) {
+                            result.startDate = value;
+                        } else if (label.includes('Tình trạng')) {
+                            result.status = value;
+                        } else if (label.includes('Loại hình DN')) {
+                            result.companyType = value;
+                        }
                     });
                     
                     return result;
@@ -1090,7 +983,12 @@ async def get_tax_info_api(keyword: str = Query(..., min_length=1, description="
             """)
             
             logger.info(f"Successfully scraped tax info for keyword: {keyword}")
-            return JSONResponse({"keyword": keyword, "data": result, "status": "success"})
+            
+            return JSONResponse({
+                "keyword": keyword,
+                "data": result,
+                "status": "success"
+            })
             
     except Exception as e:
         logger.error(f"Tax info scraping failed: {e}")
@@ -1105,24 +1003,35 @@ async def get_tax_info_api(keyword: str = Query(..., min_length=1, description="
 
 @app.get("/combined-info")
 async def get_combined_info_api(keyword: str = Query(..., min_length=1, description="Keyword to search for tax information")):
-    """Enhanced API endpoint với phone priority logic: masothue.com phone first, then PDF phone"""
+    """
+    Enhanced API endpoint với phone priority logic: masothue.com phone first, then PDF phone
+    """
     try:
         # Step 1: Get tax info with retry
         logger.info(f"Step 1: Getting tax info for keyword: {keyword}")
+        
         tax_info = await get_tax_info_internal(keyword, max_retries=3)
         
         if not tax_info or not tax_info.get('data'):
-            return JSONResponse({"error": "No tax information found for the given keyword", "keyword": keyword}, status_code=404)
+            return JSONResponse({
+                "error": "No tax information found for the given keyword",
+                "keyword": keyword
+            }, status_code=404)
         
         # Get MST from tax_info
         mst = tax_info['data'].get('taxID')
         if not mst:
-            return JSONResponse({"error": "Tax ID not found in tax information", "keyword": keyword, "tax_info": tax_info}, status_code=404)
+            return JSONResponse({
+                "error": "Tax ID not found in tax information",
+                "keyword": keyword,
+                "tax_info": tax_info
+            }, status_code=404)
         
         logger.info(f"Found MST: {mst}")
         
         # Step 2: Get contact info with retry
         logger.info(f"Step 2: Getting contact info for MST: {mst}")
+        
         contact_info = await get_contact_info_internal(mst, max_retries=3)
         
         # Step 3: Combine results with phone priority logic
@@ -1130,10 +1039,22 @@ async def get_combined_info_api(keyword: str = Query(..., min_length=1, descript
         pdf_contact = contact_info if contact_info else {}
 
         # Logic ưu tiên: phone từ masothue.com, nếu không có thì lấy từ PDF
-        final_phone = tax_data.get('phone') or pdf_contact.get('phone')
-        phone_source = "masothue.com" if tax_data.get('phone') else ("pdf" if pdf_contact.get('phone') else None)
-        
-        logger.info(f"Using phone from {phone_source}: {final_phone}" if final_phone else "No phone number found from any source")
+        # Email chỉ lấy từ PDF
+        final_phone = None
+        phone_source = None
+
+        if tax_data.get('phone'):
+            # Có phone từ masothue.com
+            final_phone = tax_data.get('phone')
+            phone_source = "masothue.com"
+            logger.info(f"Using phone from masothue.com: {final_phone}")
+        elif pdf_contact.get('phone'):
+            # Không có phone từ masothue.com, lấy từ PDF
+            final_phone = pdf_contact.get('phone')
+            phone_source = "pdf"
+            logger.info(f"Using phone from PDF: {final_phone}")
+        else:
+            logger.info("No phone number found from any source")
 
         # Tạo final_contact_info với phone đã được xử lý
         final_contact_info = {
@@ -1150,129 +1071,215 @@ async def get_combined_info_api(keyword: str = Query(..., min_length=1, descript
             "status": "success"
         }
         
-        # Step 4: Save to database
+        # Step 4: Save to database với phone đã được xử lý
         try:
-            db_saved = db_manager.save_company_info(keyword=keyword, tax_info=tax_data, contact_info=final_contact_info)
-            combined_result["database_status"] = "saved" if db_saved else "failed"
-            logger.info(f"Database save {'successful' if db_saved else 'failed'} for keyword: {keyword}")
+            # Tạo contact_info_for_db với phone đã được ưu tiên
+            contact_info_for_db = {
+                "phone": final_phone,
+                "email": pdf_contact.get('email'),
+                "phone_source": phone_source,
+                "email_source": "pdf" if pdf_contact.get('email') else None
+            }
+            
+            db_saved = db_manager.save_company_info(
+                keyword=keyword,
+                tax_info=tax_data,
+                contact_info=contact_info_for_db
+            )
+            
+            if db_saved:
+                combined_result["database_status"] = "saved"
+                logger.info(f"Successfully saved to database for keyword: {keyword}")
+            else:
+                combined_result["database_status"] = "failed"
+                logger.warning(f"Failed to save to database for keyword: {keyword}")
+                
         except Exception as db_error:
             logger.error(f"Database save error: {db_error}")
-            combined_result.update({"database_status": "error", "database_error": str(db_error)})
+            combined_result["database_status"] = "error"
+            combined_result["database_error"] = str(db_error)
         
         logger.info(f"Successfully combined information for keyword: {keyword}")
+        
         return JSONResponse(combined_result)
         
     except Exception as e:
         logger.error(f"Combined API error: {e}")
-        return JSONResponse({"error": f"Failed to get combined information: {str(e)}", "keyword": keyword}, status_code=500)
+        return JSONResponse({
+            "error": f"Failed to get combined information: {str(e)}",
+            "keyword": keyword
+        }, status_code=500)
     
 async def get_tax_info_internal(keyword: str, max_retries: int = 3):
-    """Simplified tax info function with correct Playwright syntax"""
+    """Fixed tax info function with correct Playwright syntax"""
+    browser = None
     
     for attempt in range(max_retries):
-        browser = None
         try:
             logger.info(f"Tax info attempt {attempt + 1}/{max_retries} for keyword: {keyword}")
             
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
-                    headless=True,
-                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', 
-                          '--disable-extensions', '--disable-plugins', '--single-process']
+                    headless=False,  # Bắt buộc phải là True trên server
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox', 
+                        '--disable-dev-shm-usage',
+                        '--disable-extensions',
+                        '--disable-plugins',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-features=TranslateUI',
+                        '--disable-ipc-flooding-protection',
+                        '--single-process'
+                    ]
                 )
                 
+                # Tạo context KHÔNG có timeout parameter
                 context = await browser.new_context(
                     viewport={'width': 1280, 'height': 800},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114 Safari/537.36'
                 )
-                context.set_default_timeout(60000)
+                
+                # Set timeout cho context sau khi tạo
+                context.set_default_timeout(60000)  # 1 phút
                 
                 page = await context.new_page()
+                
+                # Set timeout cho page
                 page.set_default_timeout(60000)
                 
-                # Block unnecessary resources
-                await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
+                # Chặn tài nguyên không cần thiết
+                # Chặn tài nguyên không cần thiết với exception handling
+                async def handle_route(route):
+                    try:
+                        if route.request.resource_type in ["image", "font", "media"]:
+                            await route.abort()
+                        else:
+                            await route.continue_()
+                    except Exception as e:
+                        logger.warning(f"Route handling error: {e}")
+                        try:
+                            await route.continue_()
+                        except:
+                            pass
+
+                await page.route("**/*", handle_route)
                 
-                # Navigate and search
+                logger.info(f"Navigating to masothue.com for keyword: {keyword}")
+                
+                # Truy cập trang web
                 await page.goto('https://masothue.com', timeout=60000)
                 await page.wait_for_load_state('domcontentloaded')
+                
+                # Đợi input search xuất hiện
                 await page.wait_for_selector('input[name="q"]', timeout=60000)
+                
+                # Nhập keyword và tìm kiếm
                 await page.fill('input[name="q"]', keyword)
+                
+                # Click nút tìm kiếm và đợi navigation
                 await page.click('.btn-search-submit')
                 await page.wait_for_load_state('domcontentloaded')
+                
+                # Đợi bảng kết quả tải xong
                 await page.wait_for_selector('table.table-taxinfo tbody', timeout=60000)
                 
-                # Extract data
+                # Trích xuất dữ liệu
                 result = await page.evaluate("""
                 () => {
                     const result = {};
+
+                // Lấy tên công ty từ header
+                const companyNameHeader = document.querySelector('table.table-taxinfo thead th[itemprop="name"] .copy');
+                if (companyNameHeader) {
+                    result.companyName = companyNameHeader.getAttribute('title') || companyNameHeader.innerText.trim();
+                }
+
+                // Lấy các thông tin từ tbody
+                const rows = Array.from(document.querySelectorAll('table.table-taxinfo tbody tr'));
+
+                rows.forEach(row => {
+                    const label = row.querySelector('td:first-child')?.innerText.trim();
+                    const valueCell = row.querySelector('td:nth-child(2)');
+                    if (!label || !valueCell) return;
                     
-                    // Get company name
-                    const companyNameHeader = document.querySelector('table.table-taxinfo thead th[itemprop="name"] .copy');
-                    if (companyNameHeader) {
-                        result.companyName = companyNameHeader.getAttribute('title') || companyNameHeader.innerText.trim();
+                    let value = valueCell.innerText.trim();
+                    
+                    // Xử lý trường hợp người đại diện - lấy tên từ thẻ a hoặc span
+                    if (label.includes('Người đại diện')) {
+                        const nameElement = valueCell.querySelector('[itemprop="name"]');
+                        if (nameElement) {
+                            value = nameElement.innerText.trim();
+                        }
                     }
                     
-                    // Get info from tbody
-                    const rows = Array.from(document.querySelectorAll('table.table-taxinfo tbody tr'));
-                    
-                    rows.forEach(row => {
-                        const label = row.querySelector('td:first-child')?.innerText.trim();
-                        const valueCell = row.querySelector('td:nth-child(2)');
-                        if (!label || !valueCell) return;
-                        
-                        let value = valueCell.innerText.trim();
-                        
-                        // Handle phone number extraction
-                        if (label.includes('Điện thoại')) {
-                            const phoneElement = valueCell.querySelector('span.copy');
-                            if (phoneElement) {
-                                const phoneNumber = phoneElement.getAttribute('title') || phoneElement.innerText.trim();
-                                if (phoneNumber && !phoneNumber.includes('Bị ẩn') && !phoneNumber.includes('*') && phoneNumber.length > 5) {
-                                    result.phone = phoneNumber;
-                                }
-                            } else {
-                                const phoneMatch = value.match(/(\d{2,4}[\.\-\s]?\d{3,4}[\.\-\s]?\d{3,4}[\.\-\s]?\d{0,4}|\d{9,11})/);
-                                if (phoneMatch && !value.includes('Bị ẩn') && !value.includes('*')) {
+                    // Xử lý trường hợp điện thoại - ưu tiên lấy từ span.copy
+                    if (label.includes('Điện thoại')) {
+                        // Thử lấy từ span có class="copy" trước
+                        const phoneElement = valueCell.querySelector('span.copy');
+                        if (phoneElement) {
+                            const phoneNumber = phoneElement.getAttribute('title') || phoneElement.innerText.trim();
+                            // Chỉ lấy số điện thoại nếu không bị ẩn
+                            if (phoneNumber && !phoneNumber.includes('Bị ẩn') && !phoneNumber.includes('*') && phoneNumber.length > 5) {
+                                result.phone = phoneNumber;
+                                console.log('Phone found from masothue.com:', phoneNumber);
+                            }
+                        } else {
+                            // Fallback: lấy từ text content nếu không có span.copy
+                            const phoneText = valueCell.innerText.trim();
+                            if (phoneText && !phoneText.includes('Bị ẩn') && !phoneText.includes('*') && phoneText.length > 5) {
+                                // Regex để extract phone number
+                                const phoneMatch = phoneText.match(/(\d{2,4}[\.\-\s]?\d{3,4}[\.\-\s]?\d{3,4}[\.\-\s]?\d{0,4}|\d{9,11})/);
+                                if (phoneMatch) {
                                     result.phone = phoneMatch[1];
+                                    console.log('Phone extracted from text:', phoneMatch[1]);
                                 }
                             }
                         }
-                        
-                        // Handle representative name
-                        if (label.includes('Người đại diện')) {
-                            const nameElement = valueCell.querySelector('[itemprop="name"]');
-                            if (nameElement) value = nameElement.innerText.trim();
-                        }
-                        
-                        // Map other fields
-                        const fieldMap = {
-                            'Mã số thuế': 'taxID',
-                            'Địa chỉ': 'address', 
-                            'Người đại diện': 'legalRepresentative',
-                            'Ngày hoạt động': 'startDate',
-                            'Tình trạng': 'status',
-                            'Loại hình DN': 'companyType'
-                        };
-                        
-                        Object.entries(fieldMap).forEach(([key, field]) => {
-                            if (label.includes(key)) result[field] = value;
-                        });
-                    });
+                    }
                     
+                    // Mapping các trường khác
+                    if (label.includes('Mã số thuế')) {
+                        result.taxID = value;
+                    } else if (label.includes('Địa chỉ')) {
+                        result.address = value;
+                    } else if (label.includes('Người đại diện')) {
+                        result.legalRepresentative = value;
+                    } else if (label.includes('Ngày hoạt động')) {
+                        result.startDate = value;
+                    } else if (label.includes('Tình trạng')) {
+                        result.status = value;
+                    } else if (label.includes('Loại hình DN')) {
+                        result.companyType = value;
+                    }
+                });
+
                     return result;
+                    
                 }
                 """)
+
                 
                 logger.info(f"Successfully scraped tax info for keyword: {keyword}")
-                return {"keyword": keyword, "data": result, "status": "success"}
+                
+                return {
+                    "keyword": keyword,
+                    "data": result,
+                    "status": "success"
+                }
                 
         except Exception as e:
             logger.error(f"Tax info attempt {attempt + 1} failed: {e}")
             if attempt == max_retries - 1:
                 raise Exception(f"Failed to fetch tax info after {max_retries} attempts: {str(e)}")
             
-            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            # Wait before retry
+            wait_time = 2 ** attempt
+            logger.info(f"Waiting {wait_time} seconds before retry...")
+            await asyncio.sleep(wait_time)
                 
         finally:
             if browser:
@@ -1282,7 +1289,7 @@ async def get_tax_info_internal(keyword: str, max_retries: int = 3):
                     pass
 
 async def get_contact_info_internal(mst: str, max_retries: int = 3):
-    """Enhanced contact info function with retry logic"""
+    """Enhanced contact info function with early exit for navigation failures"""
     for attempt in range(max_retries):
         try:
             logger.info(f"Contact info attempt {attempt + 1}/{max_retries} for MST: {mst}")
@@ -1296,8 +1303,13 @@ async def get_contact_info_internal(mst: str, max_retries: int = 3):
             # Crawl and download with retry
             pdf_path = await crawl_and_download_pdf(mst, max_retries=2)
             
-            if not pdf_path or not os.path.exists(pdf_path):
-                logger.info("No PDF found for MST")
+            # Nếu crawl_and_download_pdf return None do navigation failure, dừng ngay
+            if pdf_path is None:
+                logger.error("PDF crawling failed - stopping contact info extraction")
+                return None
+            
+            if not os.path.exists(pdf_path):
+                logger.info("PDF file not found")
                 return None
             
             # Extract contact information from PDF
@@ -1330,153 +1342,41 @@ async def get_contact_info_internal(mst: str, max_retries: int = 3):
             wait_time = 2 ** attempt
             logger.info(f"Waiting {wait_time} seconds before retry...")
             await asyncio.sleep(wait_time)
+    
+    return None
 
 port = int(os.environ.get("PORT", 8000))
-@app.get("/test-db")
-async def test_database_connection():
-    """
-    API endpoint để test kết nối database
-    """
-    try:
-        # Test connection
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Test query
-            cursor.execute("SELECT 1")
-            result = cursor.fetchone()
-            
-            # Get database info
-            cursor.execute("SELECT DB_NAME() as database_name")
-            db_info = cursor.fetchone()
-            
-            # Get server info
-            cursor.execute("SELECT @@VERSION as server_version")
-            server_info = cursor.fetchone()
-            
-            # Test table existence
-            cursor.execute("""
-                SELECT COUNT(*) as table_count 
-                FROM INFORMATION_SCHEMA.TABLES 
-                WHERE TABLE_NAME = 'company_info'
-            """)
-            table_exists = cursor.fetchone()[0] > 0
-            
-            # Get record count if table exists
-            record_count = 0
-            if table_exists:
-                cursor.execute("SELECT COUNT(*) FROM company_info")
-                record_count = cursor.fetchone()[0]
-            
-            return JSONResponse({
-                "status": "success",
-                "message": "Database connection successful",
-                "database_name": db_info[0] if db_info else "Unknown",
-                "server_version": server_info[0] if server_info else "Unknown",
-                "table_exists": table_exists,
-                "record_count": record_count,
-                "connection_config": {
-                    "server": SQL_SERVER_CONFIG['server'],
-                    "database": SQL_SERVER_CONFIG['database'],
-                    "username": SQL_SERVER_CONFIG['username'],
-                    "port": SQL_SERVER_CONFIG['port']
-                }
-            })
-            
-    except Exception as e:
-        logger.error(f"Database connection test failed: {e}")
-        return JSONResponse({
-            "status": "error",
-            "message": "Database connection failed",
-            "error": str(e),
-            "connection_config": {
-                "server": SQL_SERVER_CONFIG['server'],
-                "database": SQL_SERVER_CONFIG['database'],
-                "username": SQL_SERVER_CONFIG['username'],
-                "port": SQL_SERVER_CONFIG['port']
-            }
-        }, status_code=500)
 
-@app.get("/test-db2")
-async def test_database():
+def test_supabase_connection():
+    """Test Supabase connection"""
     try:
-        db_manager = DatabaseManager(SQL_SERVER_CONFIG)
+        db_manager = DatabaseManager(SUPABASE_CONFIG)
         
-        # Test TCP connection
-        tcp_test = db_manager._test_connection()
-        if not tcp_test:
-            return {"status": "error", "message": "TCP connection failed"}
+        # Test select
+        result = db_manager.supabase.table('company_info').select('id').limit(1).execute()
+        print(f"Select test: {result}")
         
-        # Test database connection
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT @@VERSION")
-            version = cursor.fetchone()[0]
-            cursor.close()
-            
-        return {
-            "status": "success", 
-            "message": "Database connection successful",
-            "server_version": version,
-            "config": {
-                "server": SQL_SERVER_CONFIG['server'],
-                "port": SQL_SERVER_CONFIG['port'],
-                "database": SQL_SERVER_CONFIG['database']
-            }
+        # Test insert
+        test_data = {
+            'keyword': 'test_keyword',
+            'tax_id': 'test_tax_id',
+            'company_name': 'Test Company',
+            'created_at': 'now()'
         }
         
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-    
-
-
-# Test connection script
-def test_connection():
-    config = {
-        'server': '26.25.148.0',  # Radmin VPN IP
-        'database': 'CompanyDB',
-        'username': 'sa',
-        'password': '123',
-        'driver': '{ODBC Driver 17 for SQL Server}',
-        'port': 1433
-    }
-    
-    connection_string = (
-        f"DRIVER={config['driver']};"
-        f"SERVER={config['server']},{config['port']};"
-        f"DATABASE={config['database']};"
-        f"UID={config['username']};"
-        f"PWD={config['password']};"
-        f"Encrypt=no;"
-        f"TrustServerCertificate=yes;"
-        f"Connection Timeout=30;"
-    )
-    
-    try:
-        print("Testing connection...")
-        conn = pyodbc.connect(connection_string)
-        cursor = conn.cursor()
+        insert_result = db_manager.supabase.table('company_info').insert(test_data).execute()
+        print(f"Insert test: {insert_result}")
         
-        # Test query
-        cursor.execute("SELECT @@VERSION, DB_NAME(), GETDATE()")
-        result = cursor.fetchone()
+        # Delete test data
+        db_manager.supabase.table('company_info').delete().eq('keyword', 'test_keyword').execute()
         
-        print("✅ Connection successful!")
-        print(f"Server version: {result[0]}")
-        print(f"Database: {result[1]}")
-        print(f"Current time: {result[2]}")
-        
-        cursor.close()
-        conn.close()
-        return True
+        print("Connection test successful!")
         
     except Exception as e:
-        print(f"❌ Connection failed: {e}")
-        return False
+        print(f"Connection test failed: {e}")
 
-    
+# Chạy test
 if __name__ == "__main__":
-    test_connection()
+    test_supabase_connection()
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
-
