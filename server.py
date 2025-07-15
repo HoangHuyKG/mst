@@ -546,11 +546,22 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                 context.set_default_timeout(180000)  # 3 phút
                 
                 # Chặn tài nguyên không cần thiết nhưng giữ lại CSS, JS và các tài nguyên quan trọng
-                await context.route("**/*", lambda route: (
-                    route.abort() if route.request.resource_type in ["image", "media", "font"] 
-                    else route.continue_()
-                ))
-                
+                async def handle_route(route):
+                    try:
+                        if route.request.resource_type in ["image", "media", "font"]:
+                            await route.abort()
+                        else:
+                            await route.continue_()
+                    except Exception as e:
+                        logger.warning(f"Route handling error: {e}")
+                        # Nếu route.continue_() bị lỗi, bỏ qua luôn
+                        try:
+                            await route.continue_()
+                        except:
+                            pass
+
+                await context.route("**/*", handle_route)
+                    
                 page = await context.new_page()
                 
                 # Set timeout cho page
@@ -558,18 +569,18 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                 
                 # Thêm error handlers
                 # Thêm error handlers với exception handling
-                async def handle_page_error(error):
+                def handle_page_error_sync(error):
                     logger.error(f"Page error: {error}")
 
-                async def handle_console(msg):
+                def handle_console_sync(msg):
                     # Bỏ qua các lỗi network không quan trọng
                     if msg.type == "error" and any(err in msg.text for err in ["net::ERR_FAILED", "net::ERR_ABORTED", "net::ERR_BLOCKED_BY_CLIENT"]):
                         return
                     if msg.type == "error":
                         logger.info(f"Console: {msg.text}")
 
-                page.on("pageerror", handle_page_error)
-                page.on("console", handle_console)
+                page.on("pageerror", handle_page_error_sync)
+                page.on("console", handle_console_sync)
                 # Xóa dòng duplicate này
                 # page.on("pageerror", lambda error: logger.error(f"Page error: {error}"))
                 # page.on("console", lambda msg: logger.info(f"Console: {msg.text}"))
@@ -1133,20 +1144,23 @@ async def get_tax_info_internal(keyword: str, max_retries: int = 3):
                 
                 # Chặn tài nguyên không cần thiết
                 # Chặn tài nguyên không cần thiết với exception handling
-                async def handle_route(route):
+                async def handle_route_safe(route):
                     try:
+                        # Kiểm tra page/context có còn hoạt động không
+                        if page.is_closed():
+                            return
+                            
                         if route.request.resource_type in ["image", "font", "media"]:
                             await route.abort()
                         else:
                             await route.continue_()
                     except Exception as e:
-                        logger.warning(f"Route handling error: {e}")
-                        try:
-                            await route.continue_()
-                        except:
-                            pass
+                        # Bỏ qua tất cả lỗi route
+                        logger.debug(f"Route handling error (ignored): {e}")
+                        pass
 
-                await page.route("**/*", handle_route)
+                if not page.is_closed():
+                    await page.route("**/*", handle_route_safe)
                 
                 logger.info(f"Navigating to masothue.com for keyword: {keyword}")
                 
