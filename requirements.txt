@@ -5,3 +5,5 @@ pdfminer.six
 requests
 pyodbc
 python-dotenv
+supabase
+psycopg2

@@ -201,7 +201,7 @@ class DatabaseManager:
             raise
     
     def save_company_info(self, keyword, tax_info, contact_info):
-        """Lưu dữ liệu vào Supabase với error handling tốt hơn"""
+        """Lưu dữ liệu vào Supabase - nếu trùng tax_id thì update"""
         try:
             # Chuẩn bị dữ liệu
             tax_data = tax_info or {}
@@ -238,34 +238,36 @@ class DatabaseManager:
                 }
             }
             
-            # Thử insert trước, nếu fail thì update
-            try:
-                # Thử insert
-                result = self.supabase.table('company_info').insert(data).execute()
-                logger.info(f"Inserted new record for keyword: {keyword}")
-                return True
-                
-            except Exception as insert_error:
-                logger.info(f"Insert failed, trying update: {insert_error}")
-                
-                # Nếu insert fail, thử update
+            # Kiểm tra xem tax_id đã tồn tại chưa
+            tax_id = tax_data.get('taxID')
+            if tax_id:
                 try:
-                    # Tìm record existing
-                    existing = self.supabase.table('company_info').select('id').eq('keyword', keyword).eq('tax_id', tax_data.get('taxID')).execute()
+                    # Tìm record theo tax_id
+                    existing = self.supabase.table('company_info').select('id').eq('tax_id', tax_id).execute()
                     
                     if existing.data:
-                        # Update existing record
+                        # Tax_id đã tồn tại - update record
                         data['updated_at'] = 'now()'
-                        result = self.supabase.table('company_info').update(data).eq('id', existing.data[0]['id']).execute()
-                        logger.info(f"Updated existing record for keyword: {keyword}")
+                        result = self.supabase.table('company_info').update(data).eq('tax_id', tax_id).execute()
+                        logger.info(f"Updated existing record for tax_id: {tax_id} with keyword: {keyword}")
                         return True
                     else:
-                        # Không tìm thấy record để update
-                        logger.error(f"No existing record found for update: {keyword}")
-                        return False
+                        # Tax_id chưa tồn tại - insert mới
+                        result = self.supabase.table('company_info').insert(data).execute()
+                        logger.info(f"Inserted new record for tax_id: {tax_id} with keyword: {keyword}")
+                        return True
                         
-                except Exception as update_error:
-                    logger.error(f"Update also failed: {update_error}")
+                except Exception as e:
+                    logger.error(f"Error checking/updating tax_id {tax_id}: {e}")
+                    return False
+            else:
+                # Không có tax_id - insert mới
+                try:
+                    result = self.supabase.table('company_info').insert(data).execute()
+                    logger.info(f"Inserted new record for keyword: {keyword} (no tax_id)")
+                    return True
+                except Exception as e:
+                    logger.error(f"Error inserting record without tax_id: {e}")
                     return False
                 
         except Exception as e:
