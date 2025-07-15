@@ -514,7 +514,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
             async with async_playwright() as p:
                 # Cấu hình browser
                 browser = await p.chromium.launch(
-                    headless=True,  # Để debug, đổi thành True khi deploy
+                    headless=False,  # Để debug, đổi thành True khi deploy
                     args=[
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
@@ -616,7 +616,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         
                         # Thử multiple selectors
                         selectors_to_try = [
-                            '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld',
+                            '#ctl00$C$ANNOUNCEMENT_TYPE_IDFilterFld',
                             'select[name*="ANNOUNCEMENT_TYPE"]',
                             'select[id*="ANNOUNCEMENT_TYPE"]'
                         ]
@@ -1100,7 +1100,7 @@ async def get_tax_info_internal(keyword: str, max_retries: int = 3):
             
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
-                    headless=True,  # Bắt buộc phải là True trên server
+                    headless=False,  # Bắt buộc phải là True trên server
                     args=[
                         '--no-sandbox',
                         '--disable-setuid-sandbox', 
