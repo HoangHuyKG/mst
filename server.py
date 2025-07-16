@@ -601,7 +601,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                                 response = await page.goto(
                                     TARGET_URL, 
                                     timeout=60000,  # Giảm timeout xuống 1 phút
-                                    wait_until='domcontentloaded'  # ✅ Nhanh hơn, ổn định hơn
+                                    wait_until='load'  # ✅ Nhanh hơn, ổn định hơn
                                 )
                                 # Kiểm tra response status
                                 if response and response.status >= 400:
@@ -710,64 +710,98 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         await page.wait_for_timeout(3000)
                         
                         # Step 6: Submit form
-                        logger.info("Submitting form...")
-                        
                         try:
-                            await page.click('#ctl00_C_BtnFilter')
-                            logger.info("Form submitted successfully")
+                            # Method 1: Try với force click và không đợi navigation
+                            try:
+                                await page.click('#ctl00_C_BtnFilter', force=True, timeout=10000)
+                                logger.info("Form submitted with force click")
+                            except:
+                                # Method 2: Fallback - evaluate JavaScript click
+                                await page.evaluate('document.getElementById("ctl00_C_BtnFilter").click()')
+                                logger.info("Form submitted with JavaScript click")
+                                
+                            # Đợi một chút để form được submit
+                            await page.wait_for_timeout(5000)
+                            
                         except Exception as submit_error:
                             logger.error(f"Form submission failed: {submit_error}")
-                            raise submit_error
+                            # Try alternative - submit form directly
+                            try:
+                                await page.evaluate("""
+                                    const form = document.querySelector('form');
+                                    if (form) {
+                                        form.submit();
+                                    } else {
+                                        // Trigger postback manually
+                                        if (typeof __doPostBack === 'function') {
+                                            __doPostBack('ctl00$C$BtnFilter', '');
+                                        }
+                                    }
+                                """)
+                                logger.info("Form submitted via alternative method")
+                                await page.wait_for_timeout(5000)
+                            except:
+                                raise submit_error
                         
-                        # Step 7: Wait for results
+                        # Step 7: Wait for results - FIX
                         logger.info("Waiting for results...")
-                        
-                        await page.wait_for_load_state('load', timeout=120000)
-                        
+
+                        # Thay đổi cách đợi results - không dùng wait_for_load_state
+                        try:
+                            # Đợi một trong các selector này xuất hiện
+                            await page.wait_for_selector('#ctl00_C_CtlList, text=Không tìm thấy dữ liệu, .no-results', timeout=60000)
+                            logger.info("Results or no-results message found")
+                        except:
+                            # Nếu không tìm thấy selector, kiểm tra URL hoặc title change
+                            current_url = page.url
+                            logger.info(f"Current URL after submit: {current_url}")
+                            
+                            # Đợi thêm một chút
+                            await page.wait_for_timeout(10000)
+
                         # Check for results table
                         try:
-                            await page.wait_for_selector('#ctl00_C_CtlList', timeout=45000)
+                            await page.wait_for_selector('#ctl00_C_CtlList', timeout=15000)
                             logger.info("Results table found")
                         except Exception:
-                            # Check for no results message
-                            try:
-                                no_results_selectors = [
-                                    'text=Không tìm thấy dữ liệu',
-                                    'text=No data found',
-                                    '.no-results',
-                                    '[id*="NoData"]'
-                                ]
+                            # Check for no results message với timeout ngắn hơn
+                            no_results_found = False
+                            no_results_selectors = [
+                                'text=Không tìm thấy dữ liệu',
+                                'text=No data found', 
+                                '.no-results',
+                                '[id*="NoData"]'
+                            ]
+                            
+                            for selector in no_results_selectors:
+                                try:
+                                    await page.wait_for_selector(selector, timeout=3000)
+                                    logger.info(f"No results found with selector: {selector} for {reg_name}")
+                                    no_results_found = True
+                                    break
+                                except:
+                                    continue
+                            
+                            if not no_results_found:
+                                logger.warning("Results table not found within timeout - continuing anyway")
                                 
-                                for selector in no_results_selectors:
-                                    try:
-                                        await page.wait_for_selector(selector, timeout=5000)
-                                        logger.info(f"No results found with selector: {selector} for {reg_name}")
-                                        break
-                                    except:
-                                        continue
-                                else:
-                                    logger.error("Results table not found within timeout")
-                                    
-                                    # Debug: Lấy thông tin trang sau khi submit
-                                    current_url = page.url
-                                    page_title = await page.title()
-                                    logger.error(f"Current URL: {current_url}")
-                                    logger.error(f"Page title: {page_title}")
-                                    
-                                    # Lưu screenshot để debug
-                                    try:
-                                        await page.screenshot(path=f"debug_{mst}_{reg_type}_{attempt}.png")
-                                        logger.info(f"Screenshot saved: debug_{mst}_{reg_type}_{attempt}.png")
-                                    except:
-                                        pass
-                                    
-                                    raise Exception("Results table not found")
+                                # Debug: Lấy thông tin trang sau khi submit
+                                current_url = page.url
+                                page_title = await page.title()
+                                logger.error(f"Current URL: {current_url}")
+                                logger.error(f"Page title: {page_title}")
                                 
-                                # Nếu không có kết quả, thử loại đăng ký tiếp theo
+                                # Lưu screenshot để debug
+                                try:
+                                    await page.screenshot(path=f"debug_{mst}_{reg_type}_{attempt}.png")
+                                    logger.info(f"Screenshot saved: debug_{mst}_{reg_type}_{attempt}.png")
+                                except:
+                                    pass
+                            
+                            # Nếu không có kết quả, thử loại đăng ký tiếp theo
+                            if no_results_found:
                                 logger.info(f"No results found for {reg_name}, trying next registration type...")
                                 continue
-                            except:
-                                pass
                         
                         # Step 8: Find and download PDF
                         logger.info("Looking for PDF download button...")
