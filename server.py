@@ -32,11 +32,11 @@ CAPTCHA_API_KEY = os.environ.get('CAPTCHA_API_KEY', 'your_default_key')
 TARGET_URL = "https://dangkyquamang.dkkd.gov.vn/egazette/Forms/Egazette/ANNOUNCEMENTSListingInsUpd.aspx"
 SITE_KEY = "6LewYU4UAAAAAD9dQ51Cj_A_1uHLOXw9wJIxi9x0"
 
-# Supabase Configuration - Sử dụng service_role key thay vì anon key
+# Thay thế SQL_SERVER_CONFIG
 SUPABASE_CONFIG = {
     'url': os.environ.get('SUPABASE_URL', 'your_supabase_url'),
-    'key': os.environ.get('SUPABASE_SERVICE_ROLE_KEY', 'your_supabase_service_role_key'),  # Đổi từ anon key sang service_role key
-    'database_url': os.environ.get('SUPABASE_DB_URL', 'postgresql://postgres:[password]@db.[project-ref].supabase.co:5432/postgres')
+    'key': os.environ.get('SUPABASE_SERVICE_ROLE_KEY', 'your_supabase_anon_key'),
+    'database_url': os.environ.get('SUPABASE_DB_URL', 'postgresql://user:password@host:port/database')
 }
 
 class CaptchaSolver:
@@ -126,15 +126,13 @@ class CaptchaSolver:
 class DatabaseManager:
     def __init__(self, config):
         self.config = config
-        # Sử dụng service_role key để bypass RLS
         self.supabase: Client = create_client(config['url'], config['key'])
         self.max_retries = 3
         self.retry_delay = 5
         
     def get_connection(self):
-        """Tạo kết nối PostgreSQL với connection string đã sửa"""
+        """Tạo kết nối PostgreSQL"""
         try:
-            # Sửa lại format connection string
             conn = psycopg2.connect(
                 self.config['database_url'],
                 cursor_factory=RealDictCursor
@@ -146,68 +144,46 @@ class DatabaseManager:
             raise
     
     def create_tables(self):
-        """Tạo bảng PostgreSQL với RLS disabled"""
+        """Tạo bảng PostgreSQL"""
         try:
-            # Sử dụng Supabase client với service_role key
-            # Hoặc tạo table trực tiếp trong Supabase Dashboard
-            
-            # Tạo table qua SQL (chạy trong Supabase SQL Editor)
-            sql_commands = """
-            -- Tạo table
-            CREATE TABLE IF NOT EXISTS company_info (
-                id SERIAL PRIMARY KEY,
-                keyword VARCHAR(255) NOT NULL,
-                tax_id VARCHAR(50),
-                company_name VARCHAR(500),
-                address VARCHAR(1000),
-                legal_representative VARCHAR(255),
-                start_date VARCHAR(100),
-                status VARCHAR(255),
-                company_type VARCHAR(255),
-                email VARCHAR(255),
-                phone VARCHAR(50),
-                raw_data JSONB,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            
-            -- Tắt RLS cho table này
-            ALTER TABLE company_info DISABLE ROW LEVEL SECURITY;
-            
-            -- Hoặc tạo policy cho phép tất cả operations
-            ALTER TABLE company_info ENABLE ROW LEVEL SECURITY;
-            
-            CREATE POLICY "Allow all operations on company_info" 
-            ON company_info FOR ALL 
-            TO authenticated, anon
-            USING (true) 
-            WITH CHECK (true);
-            """
-            
-            logger.info("Please run the following SQL commands in Supabase SQL Editor:")
-            logger.info(sql_commands)
-            
-            # Kiểm tra xem table đã tồn tại chưa
-            try:
-                result = self.supabase.table('company_info').select('id').limit(1).execute()
-                logger.info("Table company_info exists and accessible")
-                return True
-            except Exception as e:
-                logger.error(f"Table access test failed: {e}")
-                raise
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                create_table_query = """
+                CREATE TABLE IF NOT EXISTS company_info (
+                    id SERIAL PRIMARY KEY,
+                    keyword VARCHAR(255) NOT NULL,
+                    tax_id VARCHAR(50),
+                    company_name VARCHAR(500),
+                    address VARCHAR(1000),
+                    legal_representative VARCHAR(255),
+                    start_date VARCHAR(100),
+                    status VARCHAR(255),
+                    company_type VARCHAR(255),
+                    email VARCHAR(255),
+                    phone VARCHAR(50),
+                    raw_data JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+                
+                cursor.execute(create_table_query)
+                conn.commit()
+                logger.info("Database tables created successfully")
                 
         except Exception as e:
             logger.error(f"Error creating tables: {e}")
             raise
     
     def save_company_info(self, keyword, tax_info, contact_info):
-        """Lưu dữ liệu vào Supabase - nếu trùng tax_id thì update"""
+        """Lưu dữ liệu vào PostgreSQL"""
         try:
             # Chuẩn bị dữ liệu
             tax_data = tax_info or {}
             contact_data = contact_info or {}
             
-            # Logic phone priority
+            # Logic phone priority (giữ nguyên)
             final_phone = None
             phone_source = None
             
@@ -218,60 +194,120 @@ class DatabaseManager:
                 final_phone = contact_data.get('phone')
                 phone_source = "pdf"
             
-            # Chuẩn bị data cho insert/update
-            data = {
-                'keyword': keyword,
-                'tax_id': tax_data.get('taxID'),
-                'company_name': tax_data.get('companyName'),
-                'address': tax_data.get('address'),
-                'legal_representative': tax_data.get('legalRepresentative'),
-                'start_date': tax_data.get('startDate'),
-                'status': tax_data.get('status'),
-                'company_type': tax_data.get('companyType'),
-                'email': contact_data.get('email'),
-                'phone': final_phone,
-                'raw_data': {
-                    'tax_info': tax_data,
-                    'contact_info': contact_data,
-                    'phone_source': phone_source,
-                    'final_phone': final_phone
+            # Sử dụng Supabase client
+            try:
+                # Kiểm tra record tồn tại
+                existing = self.supabase.table('company_info').select('id').eq('keyword', keyword).eq('tax_id', tax_data.get('taxID')).execute()
+                
+                data = {
+                    'keyword': keyword,
+                    'tax_id': tax_data.get('taxID'),
+                    'company_name': tax_data.get('companyName'),
+                    'address': tax_data.get('address'),
+                    'legal_representative': tax_data.get('legalRepresentative'),
+                    'start_date': tax_data.get('startDate'),
+                    'status': tax_data.get('status'),
+                    'company_type': tax_data.get('companyType'),
+                    'email': contact_data.get('email'),
+                    'phone': final_phone,
+                    'raw_data': {
+                        'tax_info': tax_data,
+                        'contact_info': contact_data,
+                        'phone_source': phone_source,
+                        'final_phone': final_phone
+                    }
                 }
-            }
-            
-            # Kiểm tra xem tax_id đã tồn tại chưa
-            tax_id = tax_data.get('taxID')
-            if tax_id:
-                try:
-                    # Tìm record theo tax_id
-                    existing = self.supabase.table('company_info').select('id').eq('tax_id', tax_id).execute()
-                    
-                    if existing.data:
-                        # Tax_id đã tồn tại - update record
-                        data['updated_at'] = 'now()'
-                        result = self.supabase.table('company_info').update(data).eq('tax_id', tax_id).execute()
-                        logger.info(f"Updated existing record for tax_id: {tax_id} with keyword: {keyword}")
-                        return True
-                    else:
-                        # Tax_id chưa tồn tại - insert mới
-                        result = self.supabase.table('company_info').insert(data).execute()
-                        logger.info(f"Inserted new record for tax_id: {tax_id} with keyword: {keyword}")
-                        return True
-                        
-                except Exception as e:
-                    logger.error(f"Error checking/updating tax_id {tax_id}: {e}")
-                    return False
-            else:
-                # Không có tax_id - insert mới
-                try:
+                
+                if existing.data:
+                    # Update
+                    data['updated_at'] = 'now()'
+                    result = self.supabase.table('company_info').update(data).eq('id', existing.data[0]['id']).execute()
+                    logger.info(f"Updated existing record for keyword: {keyword}")
+                else:
+                    # Insert
                     result = self.supabase.table('company_info').insert(data).execute()
-                    logger.info(f"Inserted new record for keyword: {keyword} (no tax_id)")
-                    return True
-                except Exception as e:
-                    logger.error(f"Error inserting record without tax_id: {e}")
-                    return False
+                    logger.info(f"Inserted new record for keyword: {keyword}")
+                
+                return True
+                
+            except Exception as supabase_error:
+                logger.error(f"Supabase operation failed: {supabase_error}")
+                # Fallback to direct PostgreSQL
+                return self._save_with_postgres(keyword, tax_data, contact_data, final_phone, phone_source)
                 
         except Exception as e:
             logger.error(f"Error saving company info: {e}")
+            return False
+    
+    def _save_with_postgres(self, keyword, tax_data, contact_data, final_phone, phone_source):
+        """Fallback PostgreSQL save method"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Check existing
+                cursor.execute(
+                    "SELECT id FROM company_info WHERE keyword = %s AND tax_id = %s",
+                    (keyword, tax_data.get('taxID'))
+                )
+                existing = cursor.fetchone()
+                
+                if existing:
+                    # Update
+                    cursor.execute("""
+                        UPDATE company_info 
+                        SET company_name = %s, address = %s, legal_representative = %s,
+                            start_date = %s, status = %s, company_type = %s,
+                            email = %s, phone = %s, raw_data = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                    """, (
+                        tax_data.get('companyName'),
+                        tax_data.get('address'),
+                        tax_data.get('legalRepresentative'),
+                        tax_data.get('startDate'),
+                        tax_data.get('status'),
+                        tax_data.get('companyType'),
+                        contact_data.get('email'),
+                        final_phone,
+                        json.dumps({
+                            'tax_info': tax_data,
+                            'contact_info': contact_data,
+                            'phone_source': phone_source,
+                            'final_phone': final_phone
+                        }),
+                        existing['id']
+                    ))
+                else:
+                    # Insert
+                    cursor.execute("""
+                        INSERT INTO company_info 
+                        (keyword, tax_id, company_name, address, legal_representative,
+                        start_date, status, company_type, email, phone, raw_data)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        keyword,
+                        tax_data.get('taxID'),
+                        tax_data.get('companyName'),
+                        tax_data.get('address'),
+                        tax_data.get('legalRepresentative'),
+                        tax_data.get('startDate'),
+                        tax_data.get('status'),
+                        tax_data.get('companyType'),
+                        contact_data.get('email'),
+                        final_phone,
+                        json.dumps({
+                            'tax_info': tax_data,
+                            'contact_info': contact_data,
+                            'phone_source': phone_source,
+                            'final_phone': final_phone
+                        })
+                    ))
+                
+                conn.commit()
+                return True
+                
+        except Exception as e:
+            logger.error(f"PostgreSQL save failed: {e}")
             return False
     
     def get_company_info(self, keyword=None, tax_id=None):
@@ -496,12 +532,12 @@ async def inject_captcha_response(page, captcha_code):
     except Exception as e:
         logger.error(f"Injection failed: {e}")
         return False
-    
-async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
-    """Railway-optimized crawler with improved error handling and resource management"""
+
+async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
+    """Fixed crawl function with correct Playwright syntax"""
     browser = None
     
-    # Prioritize registration types by success rate
+    # Danh sách các loại đăng ký để thử theo thứ tự
     registration_types = [
         ('NEW', 'Đăng ký mới'),
         ('AMEND', 'Đăng ký thay đổi')
@@ -512,373 +548,357 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
             logger.info(f"Attempt {attempt + 1}/{max_retries} for MST: {mst}")
             
             async with async_playwright() as p:
-                # Ultra-lightweight browser config for Railway
+                # Cấu hình browser
                 browser = await p.chromium.launch(
-                    headless=True,
+                    headless=True,  # Để debug, đổi thành True khi deploy
                     args=[
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-dev-shm-usage',
-                        '--disable-gpu',
-                        '--disable-software-rasterizer',
-                        '--disable-background-timer-throttling',
-                        '--disable-backgrounding-occluded-windows',
-                        '--disable-renderer-backgrounding',
-                        '--disable-features=TranslateUI,VizDisplayCompositor',
                         '--disable-blink-features=AutomationControlled',
                         '--disable-web-security',
-                        '--memory-pressure-off',
-                        '--max_old_space_size=512',  # Reduced to 512MB
-                        '--single-process',
-                        '--no-zygote',
-                        '--disable-accelerated-2d-canvas',
-                        '--disable-accelerated-jpeg-decoding',
-                        '--disable-accelerated-mjpeg-decode',
-                        '--disable-accelerated-video-decode',
-                        '--disable-background-networking',
-                        '--disable-sync',
-                        '--disable-translate',
-                        '--disable-extensions',
-                        '--disable-plugins',
-                        '--disable-default-apps',
-                        '--disable-component-extensions-with-background-pages',
-                        '--disable-logging',
-                        '--disable-permissions-api',
-                        '--disable-background-mode',
-                        '--disable-hang-monitor',
-                        '--disable-prompt-on-repost',
-                        '--disable-client-side-phishing-detection',
-                        '--disable-component-update',
-                        '--disable-domain-reliability',
-                        '--disable-ipc-flooding-protection',
-                        '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    ]
+                        '--disable-features=VizDisplayCompositor',
+                        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    ],
+                     ignore_default_args=['--disable-extensions']  # Di chuyển vào đây
                 )
                 
                 context = await browser.new_context(
-                    viewport={'width': 800, 'height': 600},  # Smaller viewport
-                    user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    extra_http_headers={
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
-                        'Accept-Encoding': 'gzip, deflate',
-                        'Connection': 'keep-alive',
-                        'Cache-Control': 'no-cache'
-                    },
-                    ignore_https_errors=True,
-                    java_script_enabled=True,
-                    bypass_csp=True
-                )
+                viewport={'width': 1366, 'height': 768},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                extra_http_headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                },
+                ignore_https_errors=True,
+                java_script_enabled=True,
+                bypass_csp=True
+            )
                 
-                # Shorter timeouts for Railway
-                context.set_default_timeout(60000)  # 1 minute max
+                # Set timeout cho context sau khi tạo
+                context.set_default_timeout(180000)  # 3 phút
                 
-                # Less aggressive resource blocking - only block heavy resources
-                blocked_resources = {"image", "media", "font", "websocket", "eventsource"}
-                critical_blocked_domains = ['facebook.com', 'google-analytics.com', 'doubleclick.net']
-                
-                async def handle_route(route):
-                    try:
-                        resource_type = route.request.resource_type
-                        url = route.request.url.lower()
-                        
-                        # Only block heavy resources and critical tracking
-                        if resource_type in blocked_resources:
-                            await route.abort()
-                        elif any(domain in url for domain in critical_blocked_domains):
-                            await route.abort()
-                        else:
-                            await route.continue_()
-                    except Exception:
-                        # If route is already handled, ignore
-                        pass
-
-                await context.route("**/*", handle_route)
+                # Chặn tài nguyên không cần thiết nhưng giữ lại CSS, JS và các tài nguyên quan trọng
+                await context.route("**/*", lambda route: (
+                    route.abort() if route.request.resource_type in ["image", "media", "font"] 
+                    else route.continue_()
+                ))
                 
                 page = await context.new_page()
-                page.set_default_timeout(60000)
                 
-                # Minimal error handlers
-                page.on("pageerror", lambda error: logger.warning(f"Page error: {str(error)[:100]}"))
-                page.on("console", lambda msg: None)  # Disable console logging to save resources
+                # Set timeout cho page
+                page.set_default_timeout(180000)  # 3 phút
                 
-                # Try each registration type
+                # Thêm error handlers
+                # Thêm error handlers với exception handling
+                async def handle_page_error(error):
+                    logger.error(f"Page error: {error}")
+
+                async def handle_console(msg):
+                    # Bỏ qua các lỗi network không quan trọng
+                    if msg.type == "error" and any(err in msg.text for err in ["net::ERR_FAILED", "net::ERR_ABORTED", "net::ERR_BLOCKED_BY_CLIENT"]):
+                        return
+                    if msg.type == "error":
+                        logger.info(f"Console: {msg.text}")
+
+                page.on("pageerror", handle_page_error)
+                page.on("console", handle_console)
+                # Xóa dòng duplicate này
+                # page.on("pageerror", lambda error: logger.error(f"Page error: {error}"))
+                # page.on("console", lambda msg: logger.info(f"Console: {msg.text}"))
+                
+                # Thử từng loại đăng ký
                 for reg_type, reg_name in registration_types:
-                    logger.info(f"Trying: {reg_name}")
+                    logger.info(f"Trying registration type: {reg_name} ({reg_type})")
                     
                     try:
-                        # Step 1: Smart navigation with progressive fallback
-                        logger.info(f"Navigating for MST: {mst}")
+                        # Step 1: Navigate với retry logic
+                        logger.info(f"Navigating to target URL for MST: {mst}")
                         
-                        navigation_success = False
-                        
-                        # First try: Quick navigation with commit
-                        try:
-                            logger.info("Quick navigation attempt")
-                            response = await page.goto(
-                                TARGET_URL, 
-                                timeout=30000,  # 30 seconds
-                                wait_until='commit'
-                            )
-                            
-                            if response and response.status < 400:
-                                logger.info(f"Quick navigation success: {response.status}")
-                                navigation_success = True
-                            else:
-                                logger.warning(f"Quick navigation failed: {response.status if response else 'No response'}")
-                        except Exception as quick_nav_error:
-                            logger.warning(f"Quick navigation failed: {quick_nav_error}")
-                        
-                        # Second try: Standard navigation if quick failed
-                        if not navigation_success:
+                        for nav_attempt in range(3):
                             try:
-                                logger.info("Standard navigation attempt")
+                                logger.info(f"Navigation attempt {nav_attempt + 1}/3")
+                                
+                                # Thử truy cập trang
                                 response = await page.goto(
                                     TARGET_URL, 
-                                    timeout=45000,  # 45 seconds
-                                    wait_until='domcontentloaded'
+                                    timeout=180000, 
+                                    wait_until='networkidle'
                                 )
                                 
-                                if response and response.status < 400:
-                                    logger.info(f"Standard navigation success: {response.status}")
-                                    navigation_success = True
-                                else:
-                                    logger.warning(f"Standard navigation failed: {response.status if response else 'No response'}")
-                            except Exception as std_nav_error:
-                                logger.warning(f"Standard navigation failed: {std_nav_error}")
-                        
-                        # Third try: Reload current page if navigation failed
-                        if not navigation_success:
-                            try:
-                                logger.info("Reload attempt")
-                                await page.reload(timeout=30000, wait_until='commit')
-                                logger.info("Reload success")
-                                navigation_success = True
-                            except Exception as reload_error:
-                                logger.error(f"All navigation attempts failed: {reload_error}")
-                                continue
-                        
-                        # Wait and verify page loaded
-                        await page.wait_for_timeout(3000)  # 3 seconds
-                        
-                        # Quick page readiness check
-                        try:
-                            page_check = await page.evaluate("""
-                                () => {
-                                    return {
-                                        hasForm: !!document.querySelector('form'),
-                                        hasSelect: !!document.querySelector('select'),
-                                        url: window.location.href
-                                    };
-                                }
-                            """)
-                            
-                            if not (page_check['hasForm'] and 'egazette' in page_check['url']):
-                                logger.warning("Page not ready, skipping")
-                                continue
+                                # Kiểm tra response status
+                                if response and response.status >= 400:
+                                    logger.error(f"HTTP error: {response.status}")
+                                    raise Exception(f"HTTP {response.status} error")
                                 
-                        except Exception as check_error:
-                            logger.warning(f"Page check failed: {check_error}")
-                            continue
+                                logger.info(f"Successfully navigated to target URL. Status: {response.status if response else 'Unknown'}")
+                                
+                                # Đợi một chút để trang stable
+                                await page.wait_for_timeout(5000)
+                                break
+                                
+                            except Exception as nav_error:
+                                logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
+                                if nav_attempt == 2:
+                                    logger.error("All navigation attempts failed")
+                                    raise nav_error
+                                await asyncio.sleep(3)
                         
                         # Step 2: Wait for form elements
-                        logger.info("Waiting for form...")
+                        logger.info("Waiting for form elements...")
                         
-                        try:
-                            # Wait for both select and input to be present
-                            await page.wait_for_selector('select[id*="ANNOUNCEMENT_TYPE"]', timeout=20000)
-                            await page.wait_for_selector('input[id*="ENT_GDT_CODE"]', timeout=20000)
-                            logger.info("Form elements found")
-                        except Exception as form_wait_error:
-                            logger.error(f"Form wait failed: {form_wait_error}")
-                            continue
+                        # Thử multiple selectors
+                        selectors_to_try = [
+                            '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld',
+                            'select[name*="ANNOUNCEMENT_TYPE"]',
+                            'select[id*="ANNOUNCEMENT_TYPE"]'
+                        ]
                         
-                        # Step 3: Fill form with single attempt
-                        logger.info(f"Filling form: {reg_name}")
-                        
-                        try:
-                            # Fill select dropdown
-                            select_selector = '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld'
-                            await page.select_option(select_selector, value=reg_type)
-                            await page.wait_for_timeout(1000)
-                            
-                            # Fill input field
-                            input_selector = '#ctl00_C_ENT_GDT_CODEFld'
-                            await page.fill(input_selector, mst)
-                            await page.wait_for_timeout(1000)
-                            
-                            # Quick verification
-                            values = await page.evaluate("""
-                                () => {
-                                    const select = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
-                                    const input = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
-                                    return {
-                                        select: select ? select.value : null,
-                                        input: input ? input.value : null
-                                    };
-                                }
-                            """)
-                            
-                            if values['select'] != reg_type or values['input'] != mst:
-                                logger.error(f"Form fill verification failed: {values}")
+                        form_found = False
+                        for selector in selectors_to_try:
+                            try:
+                                await page.wait_for_selector(selector, timeout=30000)
+                                logger.info(f"Found form element with selector: {selector}")
+                                form_found = True
+                                break
+                            except Exception as e:
+                                logger.warning(f"Selector {selector} not found: {e}")
                                 continue
+                        
+                        if not form_found:
+                            # Debug: In ra HTML của trang
+                            page_content = await page.content()
+                            logger.error("Form not found. Page content preview:")
+                            logger.error(page_content[:1000] + "...")
+                            raise Exception("Form elements not found on page")
+                        
+                        # Step 3: Fill form
+                        logger.info(f"Filling form with registration type: {reg_name}")
+                        
+                        try:
+                            # Thử fill form với exception handling
+                            await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', reg_type)
+                            await page.wait_for_timeout(3000)
+                            
+                            await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
+                            await page.wait_for_timeout(2000)
                             
                             logger.info("Form filled successfully")
                             
-                        except Exception as fill_error:
-                            logger.error(f"Form fill failed: {fill_error}")
-                            continue
+                        except Exception as form_error:
+                            logger.error(f"Form filling failed: {form_error}")
+                            
+                            # Debug: Kiểm tra các elements có tồn tại không
+                            elements_info = await page.evaluate("""
+                                () => {
+                                    const info = {};
+                                    const typeSelect = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
+                                    const codeInput = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
+                                    
+                                    info.typeSelectExists = !!typeSelect;
+                                    info.codeInputExists = !!codeInput;
+                                    
+                                    if (typeSelect) {
+                                        info.typeSelectOptions = Array.from(typeSelect.options).map(opt => opt.value);
+                                    }
+                                    
+                                    return info;
+                                }
+                            """)
+                            
+                            logger.error(f"Form elements info: {elements_info}")
+                            raise form_error
                         
-                        # Step 4: Solve captcha with shorter timeout
+                        # Step 4: Solve captcha
                         logger.info("Solving captcha...")
+                        captcha_code = None
                         
-                        try:
-                            captcha_code = await asyncio.wait_for(
-                                asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL),
-                                timeout=45.0  # 45 seconds max
-                            )
-                            logger.info("Captcha solved")
-                        except Exception as captcha_error:
-                            logger.error(f"Captcha failed: {captcha_error}")
-                            continue
+                        for captcha_attempt in range(2):
+                            try:
+                                captcha_code = await asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL)
+                                logger.info("Captcha solved successfully")
+                                break
+                            except Exception as captcha_error:
+                                logger.warning(f"Captcha attempt {captcha_attempt + 1} failed: {captcha_error}")
+                                if captcha_attempt == 1:
+                                    raise captcha_error
+                                await asyncio.sleep(5)
+                        
+                        if not captcha_code:
+                            raise Exception("Failed to solve captcha")
                         
                         # Step 5: Inject captcha
                         success = await inject_captcha_response(page, captcha_code)
                         if not success:
-                            logger.error("Captcha injection failed")
-                            continue
+                            raise Exception("Failed to inject captcha response")
                         
-                        await page.wait_for_timeout(2000)
+                        await page.wait_for_timeout(3000)
                         
                         # Step 6: Submit form
                         logger.info("Submitting form...")
                         
                         try:
-                            # Use JavaScript click for reliability
-                            await page.evaluate("document.getElementById('ctl00_C_BtnFilter').click()")
-                            await page.wait_for_timeout(5000)
-                            logger.info("Form submitted")
+                            await page.click('#ctl00_C_BtnFilter')
+                            logger.info("Form submitted successfully")
                         except Exception as submit_error:
-                            logger.error(f"Submit failed: {submit_error}")
-                            continue
+                            logger.error(f"Form submission failed: {submit_error}")
+                            raise submit_error
                         
                         # Step 7: Wait for results
-                        logger.info("Checking results...")
+                        logger.info("Waiting for results...")
                         
-                        try:
-                            # Wait for either results or no data message
-                            await page.wait_for_selector(
-                                '#ctl00_C_CtlList, text=Không tìm thấy dữ liệu', 
-                                timeout=30000
-                            )
-                        except:
-                            logger.warning("Results timeout")
+                        await page.wait_for_load_state('networkidle', timeout=120000)
                         
-                        # Check if we have results
+                        # Check for results table
                         try:
-                            results_table = await page.query_selector('#ctl00_C_CtlList')
-                            if not results_table:
-                                logger.info(f"No results for {reg_name}")
+                            await page.wait_for_selector('#ctl00_C_CtlList', timeout=45000)
+                            logger.info("Results table found")
+                        except Exception:
+                            # Check for no results message
+                            try:
+                                no_results_selectors = [
+                                    'text=Không tìm thấy dữ liệu',
+                                    'text=No data found',
+                                    '.no-results',
+                                    '[id*="NoData"]'
+                                ]
+                                
+                                for selector in no_results_selectors:
+                                    try:
+                                        await page.wait_for_selector(selector, timeout=5000)
+                                        logger.info(f"No results found with selector: {selector} for {reg_name}")
+                                        break
+                                    except:
+                                        continue
+                                else:
+                                    logger.error("Results table not found within timeout")
+                                    
+                                    # Debug: Lấy thông tin trang sau khi submit
+                                    current_url = page.url
+                                    page_title = await page.title()
+                                    logger.error(f"Current URL: {current_url}")
+                                    logger.error(f"Page title: {page_title}")
+                                    
+                                    # Lưu screenshot để debug
+                                    try:
+                                        await page.screenshot(path=f"debug_{mst}_{reg_type}_{attempt}.png")
+                                        logger.info(f"Screenshot saved: debug_{mst}_{reg_type}_{attempt}.png")
+                                    except:
+                                        pass
+                                    
+                                    raise Exception("Results table not found")
+                                
+                                # Nếu không có kết quả, thử loại đăng ký tiếp theo
+                                logger.info(f"No results found for {reg_name}, trying next registration type...")
                                 continue
-                            
-                            logger.info("Results found")
-                        except Exception as results_error:
-                            logger.error(f"Results check failed: {results_error}")
-                            continue
+                            except:
+                                pass
                         
-                        # Step 8: Find and click PDF button
-                        logger.info("Looking for PDF button...")
+                        # Step 8: Find and download PDF
+                        logger.info("Looking for PDF download button...")
+                        
+                        # Thử multiple selectors cho PDF button
+                        pdf_selectors = [
+                                'input[id*="LnkGetPDFActive"]',  # Selector chính xác nhất
+                                'input[type="image"][src*="pdf"]',  # Backup selector
+                                'input[name*="LnkGetPDFActive"]',  # Thêm selector dựa vào name
+                                'input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]',
+                                'input[src*="pdf.png"]'  # Dựa vào src image
+                            ]
+                        
+                        pdf_button = None
+                        for selector in pdf_selectors:
+                            try:
+                                pdf_button = await page.query_selector(selector)
+                                if pdf_button:
+                                    logger.info(f"Found PDF button with selector: {selector}")
+                                    break
+                            except Exception as e:
+                                logger.warning(f"PDF selector {selector} failed: {e}")
+                                continue
+                        
+                        if not pdf_button:
+                            logger.info(f"No PDF button found for {reg_name}")
+                            # Nếu là loại đăng ký cuối cùng, return None
+                            if reg_type == registration_types[-1][0]:
+                                logger.info("No PDF found in any registration type")
+                                return None
+                            else:
+                                # Thử loại đăng ký tiếp theo
+                                logger.info(f"Trying next registration type...")
+                                continue
+                        
+                        # Step 9: Download PDF
+                        logger.info(f"Downloading PDF for {reg_name}...")
+                        
+                        file_name = f"{mst}_{reg_type}_{uuid.uuid4().hex[:8]}.pdf"
+                        download_path = os.path.join(os.getcwd(), file_name)
                         
                         try:
-                            # Look for PDF button
-                            pdf_button = await page.query_selector('input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]')
-                            if not pdf_button:
-                                logger.info(f"No PDF button found for {reg_name}")
-                                continue
-                            
-                            logger.info("PDF button found")
-                            
-                            # Step 9: Download PDF
-                            file_name = f"{mst}_{reg_type}_{uuid.uuid4().hex[:8]}.pdf"
-                            download_path = os.path.join(os.getcwd(), file_name)
-                            
-                            # Set up download handling
-                            async with page.expect_download(timeout=60000) as download_info:
+                            async with page.expect_download(timeout=120000) as download_info:
                                 await pdf_button.click()
+                                logger.info("Clicked PDF download button")
                             
                             download = await download_info.value
                             await download.save_as(download_path)
+                            logger.info(f"PDF downloaded successfully: {file_name}")
                             
-                            # Verify download
+                            # Verify file exists and has content
                             if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
-                                file_size = os.path.getsize(download_path)
-                                logger.info(f"PDF downloaded: {file_name} ({file_size} bytes)")
-                                
-                                # Cleanup and return success
-                                await cleanup_browser_resources(browser)
+                                logger.info(f"PDF file verified: {os.path.getsize(download_path)} bytes")
+                                logger.info(f"Successfully downloaded PDF from {reg_name}")
                                 return file_name
                             else:
-                                logger.error("Downloaded file is empty or missing")
-                                continue
+                                logger.error("Downloaded PDF file is empty or doesn't exist")
+                                # Nếu file rỗng, thử loại đăng ký tiếp theo
+                                if reg_type != registration_types[-1][0]:
+                                    logger.info("Empty PDF, trying next registration type...")
+                                    continue
+                                else:
+                                    return None
                             
                         except Exception as download_error:
-                            logger.error(f"Download failed: {download_error}")
-                            continue
+                            logger.error(f"Download failed for {reg_name}: {download_error}")
+                            # Nếu download fail và không phải loại cuối cùng, thử loại tiếp theo
+                            if reg_type != registration_types[-1][0]:
+                                logger.info("Download failed, trying next registration type...")
+                                continue
+                            else:
+                                raise Exception(f"PDF download failed for all registration types. Last error: {download_error}")
                     
                     except Exception as reg_error:
-                        logger.error(f"Registration {reg_name} failed: {reg_error}")
-                        continue
+                        logger.error(f"Registration type {reg_name} failed: {reg_error}")
+                        # Nếu không phải loại cuối cùng, thử loại tiếp theo
+                        if reg_type != registration_types[-1][0]:
+                            logger.info("Current registration type failed, trying next...")
+                            continue
+                        else:
+                            # Nếu là loại cuối cùng, raise error
+                            raise reg_error
                 
-                # If we get here, no registration type worked
-                logger.error("No registration type succeeded")
+                # Nếu đã thử hết tất cả các loại đăng ký mà không thành công
+                logger.error("All registration types failed")
                 return None
                 
         except Exception as e:
             logger.error(f"Attempt {attempt + 1} failed: {e}")
             if attempt == max_retries - 1:
-                raise Exception(f"All attempts failed: {e}")
+                raise Exception(f"All {max_retries} attempts failed. Last error: {e}")
             
             # Wait before retry
-            wait_time = 10 + (attempt * 5)  # 10s, 15s
-            logger.info(f"Retrying in {wait_time}s...")
+            wait_time = 2 ** attempt
+            logger.info(f"Waiting {wait_time} seconds before retry...")
             await asyncio.sleep(wait_time)
             
         finally:
-            # Cleanup
             if browser:
-                await cleanup_browser_resources(browser)
-
-
-async def cleanup_browser_resources(browser):
-    """Clean up browser resources properly"""
-    try:
-        # Close all contexts and their pages
-        for context in browser.contexts:
-            try:
-                # Remove route handlers
-                await context.unroute("**/*")
-                
-                # Close all pages
-                for page in context.pages:
-                    try:
-                        await page.close()
-                    except:
-                        pass
-                
-                # Close context
-                await context.close()
-            except:
-                pass
-        
-        # Close browser
-        await browser.close()
-        
-        # Brief wait for cleanup
-        await asyncio.sleep(0.3)
-        
-    except Exception as cleanup_error:
-        logger.warning(f"Cleanup error: {cleanup_error}")
-        pass
+                try:
+                    await browser.close()
+                except:
+                    pass
 
 
 @app.get("/tax-info")
@@ -1150,23 +1170,20 @@ async def get_tax_info_internal(keyword: str, max_retries: int = 3):
                 
                 # Chặn tài nguyên không cần thiết
                 # Chặn tài nguyên không cần thiết với exception handling
-                async def handle_route_safe(route):
+                async def handle_route(route):
                     try:
-                        # Kiểm tra page/context có còn hoạt động không
-                        if page.is_closed():
-                            return
-                            
                         if route.request.resource_type in ["image", "font", "media"]:
                             await route.abort()
                         else:
                             await route.continue_()
                     except Exception as e:
-                        # Bỏ qua tất cả lỗi route
-                        logger.debug(f"Route handling error (ignored): {e}")
-                        pass
+                        logger.warning(f"Route handling error: {e}")
+                        try:
+                            await route.continue_()
+                        except:
+                            pass
 
-                if not page.is_closed():
-                    await page.route("**/*", handle_route_safe)
+                await page.route("**/*", handle_route)
                 
                 logger.info(f"Navigating to masothue.com for keyword: {keyword}")
                 
@@ -1340,36 +1357,7 @@ async def get_contact_info_internal(mst: str, max_retries: int = 3):
 
 port = int(os.environ.get("PORT", 8000))
 
-def test_supabase_connection():
-    """Test Supabase connection"""
-    try:
-        db_manager = DatabaseManager(SUPABASE_CONFIG)
-        
-        # Test select
-        result = db_manager.supabase.table('company_info').select('id').limit(1).execute()
-        print(f"Select test: {result}")
-        
-        # Test insert
-        test_data = {
-            'keyword': 'test_keyword',
-            'tax_id': 'test_tax_id',
-            'company_name': 'Test Company',
-            'created_at': 'now()'
-        }
-        
-        insert_result = db_manager.supabase.table('company_info').insert(test_data).execute()
-        print(f"Insert test: {insert_result}")
-        
-        # Delete test data
-        db_manager.supabase.table('company_info').delete().eq('keyword', 'test_keyword').execute()
-        
-        print("Connection test successful!")
-        
-    except Exception as e:
-        print(f"Connection test failed: {e}")
-
-# Chạy test
+ 
 if __name__ == "__main__":
-    test_supabase_connection()
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
