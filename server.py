@@ -496,7 +496,7 @@ async def inject_captcha_response(page, captcha_code):
     except Exception as e:
         logger.error(f"Injection failed: {e}")
         return False
- async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
+async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
     """Ultra-optimized crawl function for Railway.com trial deployment"""
     browser = None
     
