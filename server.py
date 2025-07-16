@@ -498,10 +498,10 @@ async def inject_captcha_response(page, captcha_code):
         return False
     
 async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
-    """Ultra-optimized crawl function for Railway.com trial deployment with improved navigation"""
+    """Railway-optimized crawler with improved error handling and resource management"""
     browser = None
     
-    # Chỉ thử loại đăng ký có khả năng thành công cao nhất trước
+    # Prioritize registration types by success rate
     registration_types = [
         ('NEW', 'Đăng ký mới'),
         ('AMEND', 'Đăng ký thay đổi')
@@ -512,7 +512,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
             logger.info(f"Attempt {attempt + 1}/{max_retries} for MST: {mst}")
             
             async with async_playwright() as p:
-                # Cấu hình browser siêu tối ưu cho Railway trial
+                # Ultra-lightweight browser config for Railway
                 browser = await p.chromium.launch(
                     headless=True,
                     args=[
@@ -524,11 +524,11 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                         '--disable-background-timer-throttling',
                         '--disable-backgrounding-occluded-windows',
                         '--disable-renderer-backgrounding',
-                        '--disable-features=TranslateUI',
+                        '--disable-features=TranslateUI,VizDisplayCompositor',
                         '--disable-blink-features=AutomationControlled',
                         '--disable-web-security',
                         '--memory-pressure-off',
-                        '--max_old_space_size=1024',  # Giảm xuống 1GB cho trial
+                        '--max_old_space_size=512',  # Reduced to 512MB
                         '--single-process',
                         '--no-zygote',
                         '--disable-accelerated-2d-canvas',
@@ -550,319 +550,192 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                         '--disable-client-side-phishing-detection',
                         '--disable-component-update',
                         '--disable-domain-reliability',
+                        '--disable-ipc-flooding-protection',
                         '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                     ]
                 )
                 
                 context = await browser.new_context(
-                    viewport={'width': 1024, 'height': 600},  # Giảm thêm resolution
+                    viewport={'width': 800, 'height': 600},  # Smaller viewport
                     user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                     extra_http_headers={
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                         'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
                         'Accept-Encoding': 'gzip, deflate',
                         'Connection': 'keep-alive',
-                        'Cache-Control': 'max-age=0'
+                        'Cache-Control': 'no-cache'
                     },
                     ignore_https_errors=True,
                     java_script_enabled=True,
                     bypass_csp=True
                 )
                 
-                # Tăng timeout cho Railway trial
-                context.set_default_timeout(90000)  # 1.5 phút
+                # Shorter timeouts for Railway
+                context.set_default_timeout(60000)  # 1 minute max
                 
-                # Chặn tài nguyên không cần thiết - với cleanup tốt hơn
-                blocked_resources = {"image", "media", "font", "stylesheet", "websocket", "eventsource"}
-                blocked_domains = ['analytics', 'tracking', 'ads', 'facebook', 'google-analytics',
-                                 'googletagmanager', 'doubleclick', 'googlesyndication',
-                                 'amazon-adsystem', 'twitter', 'linkedin', 'pinterest']
+                # Less aggressive resource blocking - only block heavy resources
+                blocked_resources = {"image", "media", "font", "websocket", "eventsource"}
+                critical_blocked_domains = ['facebook.com', 'google-analytics.com', 'doubleclick.net']
                 
                 async def handle_route(route):
                     try:
                         resource_type = route.request.resource_type
-                        url = route.request.url
+                        url = route.request.url.lower()
                         
-                        # Chặn tài nguyên không cần thiết
+                        # Only block heavy resources and critical tracking
                         if resource_type in blocked_resources:
                             await route.abort()
-                        # Chặn domain tracking/ads
-                        elif any(domain in url for domain in blocked_domains):
+                        elif any(domain in url for domain in critical_blocked_domains):
                             await route.abort()
                         else:
                             await route.continue_()
                     except Exception:
-                        # Nếu route đã bị hủy, không thử tiếp
+                        # If route is already handled, ignore
                         pass
 
                 await context.route("**/*", handle_route)
                 
                 page = await context.new_page()
-                page.set_default_timeout(90000)  # 1.5 phút
+                page.set_default_timeout(60000)
                 
-                # Minimal error handlers với cleanup
-                def handle_page_error_sync(error):
-                    if "net::ERR_" not in str(error):
-                        logger.error(f"Page error: {error}")
-
-                def handle_console_sync(msg):
-                    if msg.type == "error" and "net::ERR_" not in msg.text:
-                        logger.info(f"Console: {msg.text}")
-
-                page.on("pageerror", handle_page_error_sync)
-                page.on("console", handle_console_sync)
+                # Minimal error handlers
+                page.on("pageerror", lambda error: logger.warning(f"Page error: {str(error)[:100]}"))
+                page.on("console", lambda msg: None)  # Disable console logging to save resources
                 
-                # Thêm cleanup handler cho page
-                page.on("close", lambda: logger.info("Page closed"))
-                
-                # Thử từng loại đăng ký
+                # Try each registration type
                 for reg_type, reg_name in registration_types:
                     logger.info(f"Trying: {reg_name}")
                     
                     try:
-                        # Step 1: Navigate với strategy cải tiến
+                        # Step 1: Smart navigation with progressive fallback
                         logger.info(f"Navigating for MST: {mst}")
                         
                         navigation_success = False
-                        for nav_attempt in range(5):  # Tăng từ 3 lên 5 lần thử
-                            try:
-                                logger.info(f"Navigation attempt {nav_attempt + 1}/5")
-                                
-                                # Progressive timeout reduction với wait strategy khác nhau
-                                if nav_attempt == 0:
-                                    # Thử với timeout dài nhất và domcontentloaded
-                                    response = await page.goto(
-                                        TARGET_URL, 
-                                        timeout=90000,  # 1.5 phút
-                                        wait_until='domcontentloaded'
-                                    )
-                                elif nav_attempt == 1:
-                                    # Thử với networkidle
-                                    response = await page.goto(
-                                        TARGET_URL, 
-                                        timeout=75000,  # 1.25 phút
-                                        wait_until='networkidle'
-                                    )
-                                elif nav_attempt == 2:
-                                    # Thử với load event
-                                    response = await page.goto(
-                                        TARGET_URL, 
-                                        timeout=60000,  # 1 phút
-                                        wait_until='load'
-                                    )
-                                elif nav_attempt == 3:
-                                    # Thử với commit (không đợi load hoàn toàn)
-                                    response = await page.goto(
-                                        TARGET_URL, 
-                                        timeout=45000,  # 45s
-                                        wait_until='commit'
-                                    )
-                                else:
-                                    # Lần cuối không đợi gì cả
-                                    response = await page.goto(
-                                        TARGET_URL, 
-                                        timeout=30000,  # 30s
-                                        wait_until='commit'
-                                    )
-                                
-                                if response and response.status >= 400:
-                                    logger.warning(f"HTTP {response.status} on attempt {nav_attempt + 1}")
-                                    if nav_attempt < 4:
-                                        await asyncio.sleep(3)
-                                        continue
-                                    else:
-                                        raise Exception(f"HTTP {response.status}")
-                                
-                                logger.info(f"Navigation OK: {response.status if response else 'Unknown'}")
+                        
+                        # First try: Quick navigation with commit
+                        try:
+                            logger.info("Quick navigation attempt")
+                            response = await page.goto(
+                                TARGET_URL, 
+                                timeout=30000,  # 30 seconds
+                                wait_until='commit'
+                            )
+                            
+                            if response and response.status < 400:
+                                logger.info(f"Quick navigation success: {response.status}")
                                 navigation_success = True
-                                break
-                                
-                            except Exception as nav_error:
-                                logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
-                                if nav_attempt < 4:
-                                    # Tăng thời gian đợi giữa các lần thử
-                                    wait_time = min(5 + (nav_attempt * 2), 15)  # 5s, 7s, 9s, 11s, max 15s
-                                    logger.info(f"Waiting {wait_time}s before retry...")
-                                    await asyncio.sleep(wait_time)
-                                    continue
-                                else:
-                                    logger.error(f"All navigation attempts failed: {nav_error}")
-                                    raise nav_error
+                            else:
+                                logger.warning(f"Quick navigation failed: {response.status if response else 'No response'}")
+                        except Exception as quick_nav_error:
+                            logger.warning(f"Quick navigation failed: {quick_nav_error}")
                         
+                        # Second try: Standard navigation if quick failed
                         if not navigation_success:
-                            raise Exception("Navigation failed after all attempts")
-                        
-                        # Đợi lâu hơn và kiểm tra nhiều lần
-                        await page.wait_for_timeout(5000)  # 5 giây
-                        
-                        # Kiểm tra trang đã load đúng chưa với retry
-                        page_ready = False
-                        for check_attempt in range(3):
                             try:
-                                page_check = await page.evaluate("""
-                                    () => {
-                                        return {
-                                            title: document.title,
-                                            url: window.location.href,
-                                            hasForm: !!document.querySelector('form'),
-                                            readyState: document.readyState,
-                                            bodyText: document.body ? document.body.innerText.substring(0, 100) : 'No body'
-                                        };
-                                    }
-                                """)
-                                logger.info(f"Page check {check_attempt + 1}: {page_check}")
+                                logger.info("Standard navigation attempt")
+                                response = await page.goto(
+                                    TARGET_URL, 
+                                    timeout=45000,  # 45 seconds
+                                    wait_until='domcontentloaded'
+                                )
                                 
-                                if 'egazette' in page_check['url'] and page_check['hasForm']:
-                                    page_ready = True
-                                    break
-                                elif check_attempt < 2:
-                                    logger.warning(f"Page not ready on check {check_attempt + 1}, waiting...")
-                                    await page.wait_for_timeout(5000)
-                                    
-                            except Exception as check_error:
-                                logger.warning(f"Page check {check_attempt + 1} failed: {check_error}")
-                                if check_attempt < 2:
-                                    await page.wait_for_timeout(3000)
+                                if response and response.status < 400:
+                                    logger.info(f"Standard navigation success: {response.status}")
+                                    navigation_success = True
+                                else:
+                                    logger.warning(f"Standard navigation failed: {response.status if response else 'No response'}")
+                            except Exception as std_nav_error:
+                                logger.warning(f"Standard navigation failed: {std_nav_error}")
                         
-                        if not page_ready:
-                            logger.error("Page not ready after all checks")
+                        # Third try: Reload current page if navigation failed
+                        if not navigation_success:
+                            try:
+                                logger.info("Reload attempt")
+                                await page.reload(timeout=30000, wait_until='commit')
+                                logger.info("Reload success")
+                                navigation_success = True
+                            except Exception as reload_error:
+                                logger.error(f"All navigation attempts failed: {reload_error}")
+                                continue
+                        
+                        # Wait and verify page loaded
+                        await page.wait_for_timeout(3000)  # 3 seconds
+                        
+                        # Quick page readiness check
+                        try:
+                            page_check = await page.evaluate("""
+                                () => {
+                                    return {
+                                        hasForm: !!document.querySelector('form'),
+                                        hasSelect: !!document.querySelector('select'),
+                                        url: window.location.href
+                                    };
+                                }
+                            """)
+                            
+                            if not (page_check['hasForm'] and 'egazette' in page_check['url']):
+                                logger.warning("Page not ready, skipping")
+                                continue
+                                
+                        except Exception as check_error:
+                            logger.warning(f"Page check failed: {check_error}")
                             continue
                         
-                        # Step 2: Wait for form với multiple strategies và timeout dài hơn
+                        # Step 2: Wait for form elements
                         logger.info("Waiting for form...")
                         
-                        form_ready = False
-                        for form_attempt in range(5):  # Tăng từ 3 lên 5 lần thử
-                            try:
-                                logger.info(f"Form wait attempt {form_attempt + 1}/5")
-                                
-                                # Tăng timeout cho form
-                                if form_attempt == 0:
-                                    await page.wait_for_selector('select[id*="ANNOUNCEMENT_TYPE"]', timeout=45000)
-                                elif form_attempt == 1:
-                                    await page.wait_for_selector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', timeout=40000)
-                                elif form_attempt == 2:
-                                    await page.wait_for_selector('select', timeout=35000)
-                                elif form_attempt == 3:
-                                    await page.wait_for_selector('form', timeout=30000)
-                                else:
-                                    await page.wait_for_selector('input', timeout=25000)
-                                
-                                # Kiểm tra form ready
-                                form_check = await page.evaluate("""
-                                    () => {
-                                        const select = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
-                                        const input = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
-                                        return {
-                                            hasSelect: !!select,
-                                            hasInput: !!input,
-                                            selectOptions: select ? select.options.length : 0,
-                                            selectValue: select ? select.value : null,
-                                            formCount: document.querySelectorAll('form').length
-                                        };
-                                    }
-                                """)
-                                
-                                logger.info(f"Form check {form_attempt + 1}: {form_check}")
-                                
-                                if form_check['hasSelect'] and form_check['hasInput'] and form_check['selectOptions'] > 0:
-                                    logger.info("Form is ready")
-                                    form_ready = True
-                                    break
-                                else:
-                                    logger.warning(f"Form not ready on attempt {form_attempt + 1}")
-                                    if form_attempt < 4:
-                                        await page.wait_for_timeout(5000)  # Đợi 5s
-                                        continue
-                                        
-                            except Exception as form_error:
-                                logger.warning(f"Form wait attempt {form_attempt + 1} failed: {form_error}")
-                                if form_attempt < 4:
-                                    await page.wait_for_timeout(5000)  # Đợi 5s
-                                    continue
-                                else:
-                                    break
-                        
-                        if not form_ready:
-                            logger.error("Form not ready after all attempts")
+                        try:
+                            # Wait for both select and input to be present
+                            await page.wait_for_selector('select[id*="ANNOUNCEMENT_TYPE"]', timeout=20000)
+                            await page.wait_for_selector('input[id*="ENT_GDT_CODE"]', timeout=20000)
+                            logger.info("Form elements found")
+                        except Exception as form_wait_error:
+                            logger.error(f"Form wait failed: {form_wait_error}")
                             continue
                         
-                        # Step 3: Fill form với retry nhiều hơn
+                        # Step 3: Fill form with single attempt
                         logger.info(f"Filling form: {reg_name}")
                         
-                        form_filled = False
-                        for fill_attempt in range(3):  # Tăng từ 2 lên 3 lần thử
-                            try:
-                                logger.info(f"Form fill attempt {fill_attempt + 1}/3")
-                                
-                                # Fill select với wait dài hơn
-                                select_selector = '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld'
-                                await page.wait_for_selector(select_selector, timeout=30000)
-                                
-                                # Clear và fill select
-                                await page.evaluate(f"""
-                                    () => {{
-                                        const select = document.querySelector('{select_selector}');
-                                        if (select) {{
-                                            select.value = '{reg_type}';
-                                            select.dispatchEvent(new Event('change'));
-                                        }}
-                                    }}
-                                """)
-                                await page.wait_for_timeout(2000)  # Đợi 2s
-                                
-                                # Fill input với wait dài hơn
-                                input_selector = '#ctl00_C_ENT_GDT_CODEFld'
-                                await page.wait_for_selector(input_selector, timeout=30000)
-                                
-                                # Clear và fill input
-                                await page.fill(input_selector, '')  # Clear trước
-                                await page.fill(input_selector, mst)
-                                await page.wait_for_timeout(2000)  # Đợi 2s
-                                
-                                # Verify form filled
-                                verify_result = await page.evaluate("""
-                                    () => {
-                                        const select = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
-                                        const input = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
-                                        return {
-                                            selectValue: select ? select.value : null,
-                                            inputValue: input ? input.value : null
-                                        };
-                                    }
-                                """)
-                                
-                                logger.info(f"Form values: {verify_result}")
-                                
-                                if verify_result['selectValue'] == reg_type and verify_result['inputValue'] == mst:
-                                    logger.info("Form filled successfully")
-                                    form_filled = True
-                                    break
-                                else:
-                                    logger.warning(f"Form fill verification failed on attempt {fill_attempt + 1}")
-                                    if fill_attempt < 2:
-                                        await page.wait_for_timeout(3000)
-                                        continue
-                                    
-                            except Exception as fill_error:
-                                logger.error(f"Form fill attempt {fill_attempt + 1} failed: {fill_error}")
-                                if fill_attempt < 2:
-                                    await page.wait_for_timeout(3000)
-                                    continue
-                                else:
-                                    break
-                        
-                        if not form_filled:
-                            logger.error("Form fill failed after all attempts")
+                        try:
+                            # Fill select dropdown
+                            select_selector = '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld'
+                            await page.select_option(select_selector, value=reg_type)
+                            await page.wait_for_timeout(1000)
+                            
+                            # Fill input field
+                            input_selector = '#ctl00_C_ENT_GDT_CODEFld'
+                            await page.fill(input_selector, mst)
+                            await page.wait_for_timeout(1000)
+                            
+                            # Quick verification
+                            values = await page.evaluate("""
+                                () => {
+                                    const select = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
+                                    const input = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
+                                    return {
+                                        select: select ? select.value : null,
+                                        input: input ? input.value : null
+                                    };
+                                }
+                            """)
+                            
+                            if values['select'] != reg_type or values['input'] != mst:
+                                logger.error(f"Form fill verification failed: {values}")
+                                continue
+                            
+                            logger.info("Form filled successfully")
+                            
+                        except Exception as fill_error:
+                            logger.error(f"Form fill failed: {fill_error}")
                             continue
                         
-                        # Step 4: Solve captcha với timeout dài hơn
+                        # Step 4: Solve captcha with shorter timeout
                         logger.info("Solving captcha...")
                         
                         try:
                             captcha_code = await asyncio.wait_for(
                                 asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL),
-                                timeout=60.0  # Tăng từ 45s lên 60s
+                                timeout=45.0  # 45 seconds max
                             )
                             logger.info("Captcha solved")
                         except Exception as captcha_error:
@@ -875,102 +748,77 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                             logger.error("Captcha injection failed")
                             continue
                         
-                        await page.wait_for_timeout(3000)  # Đợi 3s
+                        await page.wait_for_timeout(2000)
                         
-                        # Step 6: Submit form với retry
-                        submit_success = False
-                        for submit_attempt in range(3):
-                            try:
-                                logger.info(f"Submit attempt {submit_attempt + 1}/3")
-                                await page.click('#ctl00_C_BtnFilter', force=True, timeout=30000)
-                                await page.wait_for_timeout(5000)  # Đợi 5s
-                                submit_success = True
-                                break
-                                
-                            except Exception as submit_error:
-                                logger.warning(f"Submit attempt {submit_attempt + 1} failed: {submit_error}")
-                                if submit_attempt < 2:
-                                    try:
-                                        await page.evaluate("document.getElementById('ctl00_C_BtnFilter').click()")
-                                        await page.wait_for_timeout(5000)
-                                        submit_success = True
-                                        break
-                                    except Exception:
-                                        await page.wait_for_timeout(3000)
-                                        continue
-                                else:
-                                    logger.error("All submit attempts failed")
+                        # Step 6: Submit form
+                        logger.info("Submitting form...")
                         
-                        if not submit_success:
+                        try:
+                            # Use JavaScript click for reliability
+                            await page.evaluate("document.getElementById('ctl00_C_BtnFilter').click()")
+                            await page.wait_for_timeout(5000)
+                            logger.info("Form submitted")
+                        except Exception as submit_error:
+                            logger.error(f"Submit failed: {submit_error}")
                             continue
                         
-                        # Step 7: Wait for results với timeout dài hơn
+                        # Step 7: Wait for results
                         logger.info("Checking results...")
                         
                         try:
-                            await page.wait_for_selector('#ctl00_C_CtlList, text=Không tìm thấy dữ liệu', timeout=60000)  # 1 phút
+                            # Wait for either results or no data message
+                            await page.wait_for_selector(
+                                '#ctl00_C_CtlList, text=Không tìm thấy dữ liệu', 
+                                timeout=30000
+                            )
                         except:
                             logger.warning("Results timeout")
-                            await page.wait_for_timeout(3000)
                         
-                        # Kiểm tra có kết quả không
+                        # Check if we have results
                         try:
-                            await page.wait_for_selector('#ctl00_C_CtlList', timeout=20000)
-                            logger.info("Results found")
-                        except:
-                            logger.info(f"No results for {reg_name}")
-                            continue
-                        
-                        # Step 8: Find PDF button
-                        logger.info("Finding PDF button...")
-                        
-                        pdf_selectors = [
-                            'input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]',
-                            'a[href*="pdf"]',
-                            'input[value*="PDF"]'
-                        ]
-                        
-                        pdf_button = None
-                        for selector in pdf_selectors:
-                            try:
-                                pdf_button = await page.query_selector(selector)
-                                if pdf_button:
-                                    logger.info(f"Found PDF button: {selector}")
-                                    break
-                            except:
+                            results_table = await page.query_selector('#ctl00_C_CtlList')
+                            if not results_table:
+                                logger.info(f"No results for {reg_name}")
                                 continue
-                        
-                        if not pdf_button:
-                            logger.info(f"No PDF for {reg_name}")
+                            
+                            logger.info("Results found")
+                        except Exception as results_error:
+                            logger.error(f"Results check failed: {results_error}")
                             continue
                         
-                        # Step 9: Download PDF
-                        logger.info(f"Downloading PDF: {reg_name}")
-                        
-                        file_name = f"{mst}_{reg_type}_{uuid.uuid4().hex[:8]}.pdf"
-                        download_path = os.path.join(os.getcwd(), file_name)
+                        # Step 8: Find and click PDF button
+                        logger.info("Looking for PDF button...")
                         
                         try:
-                            async with page.expect_download(timeout=120000) as download_info:  # 2 phút
+                            # Look for PDF button
+                            pdf_button = await page.query_selector('input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]')
+                            if not pdf_button:
+                                logger.info(f"No PDF button found for {reg_name}")
+                                continue
+                            
+                            logger.info("PDF button found")
+                            
+                            # Step 9: Download PDF
+                            file_name = f"{mst}_{reg_type}_{uuid.uuid4().hex[:8]}.pdf"
+                            download_path = os.path.join(os.getcwd(), file_name)
+                            
+                            # Set up download handling
+                            async with page.expect_download(timeout=60000) as download_info:
                                 await pdf_button.click()
                             
                             download = await download_info.value
                             await download.save_as(download_path)
                             
+                            # Verify download
                             if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
-                                logger.info(f"PDF downloaded: {file_name} ({os.path.getsize(download_path)} bytes)")
+                                file_size = os.path.getsize(download_path)
+                                logger.info(f"PDF downloaded: {file_name} ({file_size} bytes)")
                                 
-                                # Cleanup trước khi return
-                                try:
-                                    await context.unroute("**/*")
-                                    await page.close()
-                                    await context.close()
-                                except:
-                                    pass
-                                
+                                # Cleanup and return success
+                                await cleanup_browser_resources(browser)
                                 return file_name
                             else:
-                                logger.error("Empty PDF file")
+                                logger.error("Downloaded file is empty or missing")
                                 continue
                             
                         except Exception as download_error:
@@ -981,6 +829,8 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                         logger.error(f"Registration {reg_name} failed: {reg_error}")
                         continue
                 
+                # If we get here, no registration type worked
+                logger.error("No registration type succeeded")
                 return None
                 
         except Exception as e:
@@ -988,43 +838,47 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
             if attempt == max_retries - 1:
                 raise Exception(f"All attempts failed: {e}")
             
-            # Tăng thời gian đợi giữa các lần thử
-            wait_time = min(5 + (attempt * 5), 20)  # 5s, 10s, 15s, max 20s
-            logger.info(f"Retry in {wait_time}s...")
+            # Wait before retry
+            wait_time = 10 + (attempt * 5)  # 10s, 15s
+            logger.info(f"Retrying in {wait_time}s...")
             await asyncio.sleep(wait_time)
             
         finally:
-            # Cleanup tốt hơn để tránh pending tasks
+            # Cleanup
             if browser:
-                try:
-                    # Đóng tất cả pages trước
-                    contexts = browser.contexts
-                    for context in contexts:
-                        try:
-                            # Xóa route handlers trước khi đóng
-                            await context.unroute("**/*")
-                            
-                            # Đóng tất cả pages
-                            for page in context.pages:
-                                try:
-                                    await page.close()
-                                except:
-                                    pass
-                            
-                            # Đóng context
-                            await context.close()
-                        except:
-                            pass
-                    
-                    # Đóng browser
-                    await browser.close()
-                    
-                    # Đợi một chút để cleanup hoàn tất
-                    await asyncio.sleep(0.5)  # Tăng từ 0.1s lên 0.5s
-                    
-                except Exception as cleanup_error:
-                    logger.warning(f"Cleanup warning: {cleanup_error}")
-                    pass
+                await cleanup_browser_resources(browser)
+
+
+async def cleanup_browser_resources(browser):
+    """Clean up browser resources properly"""
+    try:
+        # Close all contexts and their pages
+        for context in browser.contexts:
+            try:
+                # Remove route handlers
+                await context.unroute("**/*")
+                
+                # Close all pages
+                for page in context.pages:
+                    try:
+                        await page.close()
+                    except:
+                        pass
+                
+                # Close context
+                await context.close()
+            except:
+                pass
+        
+        # Close browser
+        await browser.close()
+        
+        # Brief wait for cleanup
+        await asyncio.sleep(0.3)
+        
+    except Exception as cleanup_error:
+        logger.warning(f"Cleanup error: {cleanup_error}")
+        pass
 
 
 @app.get("/tax-info")
