@@ -498,7 +498,7 @@ async def inject_captcha_response(page, captcha_code):
         return False
 
 async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
-    """Optimized crawl function for server environment with proper error handling"""
+    """Optimized crawl function for server environment"""
     browser = None
     
     # Danh sách các loại đăng ký để thử theo thứ tự
@@ -529,6 +529,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         '--disable-web-security',
                         '--memory-pressure-off',
                         '--max_old_space_size=4096',
+                        '--single-process',  # Giảm memory usage
                         '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                     ]
                 )
@@ -549,7 +550,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                 )
                 
                 # Tăng timeout cho server
-                context.set_default_timeout(180000)  # 3 phút
+                context.set_default_timeout(120000)  # 2 phút
                 
                 # Chặn tài nguyên không cần thiết
                 async def handle_route(route):
@@ -569,7 +570,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                 await context.route("**/*", handle_route)
                 
                 page = await context.new_page()
-                page.set_default_timeout(180000)  # 3 phút
+                page.set_default_timeout(120000)  # 2 phút
                 
                 # Error handlers
                 def handle_page_error_sync(error):
@@ -589,17 +590,18 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                     logger.info(f"Trying registration type: {reg_name} ({reg_type})")
                     
                     try:
-                        # Step 1: Navigate với retry logic
+                        # Step 1: Navigate với retry logic và timeout dài hơn
                         logger.info(f"Navigating to target URL for MST: {mst}")
                         
                         for nav_attempt in range(3):
                             try:
                                 logger.info(f"Navigation attempt {nav_attempt + 1}/3")
                                 
+                                # Timeout dài hơn cho server
                                 response = await page.goto(
                                     TARGET_URL, 
-                                    timeout=180000,  # 3 phút
-                                    wait_until='domcontentloaded'  # Chỉ đợi DOM load
+                                    timeout=120000,  # 2 phút
+                                    wait_until='networkidle'  # Đợi network idle thay vì load
                                 )
                                 
                                 if response and response.status >= 400:
@@ -608,92 +610,35 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                                 
                                 logger.info(f"Successfully navigated to target URL. Status: {response.status if response else 'Unknown'}")
                                 
-                                # Đợi JavaScript load
-                                await page.wait_for_timeout(15000)  # 15 giây
+                                # Đợi JavaScript load hoàn toàn
+                                await page.wait_for_timeout(10000)  # Tăng từ 5s lên 10s
                                 break
                                 
                             except Exception as nav_error:
                                 logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
                                 if nav_attempt == 2:
+                                    logger.error("All navigation attempts failed")
                                     raise nav_error
-                                await asyncio.sleep(10)
+                                await asyncio.sleep(5)  # Đợi lâu hơn
                         
-                        # Step 2: Wait for form elements với fallback strategies
+                        # Step 2: Wait for form elements với nhiều strategies
                         logger.info("Waiting for form elements...")
                         
+                        # Đợi lâu hơn cho form elements
                         form_found = False
-                        for wait_attempt in range(5):  # Tăng số lần thử
+                        for wait_attempt in range(3):
                             try:
-                                logger.info(f"Form wait attempt {wait_attempt + 1}/5")
+                                logger.info(f"Form wait attempt {wait_attempt + 1}/3")
                                 
-                                # Thử nhiều selector khác nhau
-                                selectors_to_try = [
-                                    'select[id*="ANNOUNCEMENT_TYPE"]',
-                                    '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld',
-                                    'select[name*="ANNOUNCEMENT_TYPE"]'
-                                ]
+                                # Đợi select dropdown xuất hiện
+                                await page.wait_for_selector('select[id*="ANNOUNCEMENT_TYPE"]', timeout=60000)
                                 
-                                select_found = False
-                                for selector in selectors_to_try:
-                                    try:
-                                        await page.wait_for_selector(selector, timeout=30000)
-                                        select_found = True
-                                        logger.info(f"Found select with selector: {selector}")
-                                        break
-                                    except:
-                                        continue
-                                
-                                if not select_found:
-                                    raise Exception("Select element not found")
-                                
-                                # Kiểm tra input field
-                                input_selectors = [
-                                    '#ctl00_C_ENT_GDT_CODEFld',
-                                    'input[id*="ENT_GDT_CODE"]',
-                                    'input[name*="ENT_GDT_CODE"]'
-                                ]
-                                
-                                input_found = False
-                                for selector in input_selectors:
-                                    try:
-                                        await page.wait_for_selector(selector, timeout=30000)
-                                        input_found = True
-                                        logger.info(f"Found input with selector: {selector}")
-                                        break
-                                    except:
-                                        continue
-                                
-                                if not input_found:
-                                    raise Exception("Input element not found")
-                                
-                                # Kiểm tra form readiness
+                                # Kiểm tra xem form đã ready chưa
                                 form_ready = await page.evaluate("""
                                     () => {
-                                        const selectors = [
-                                            '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld',
-                                            'select[id*="ANNOUNCEMENT_TYPE"]',
-                                            'select[name*="ANNOUNCEMENT_TYPE"]'
-                                        ];
-                                        
-                                        let select = null;
-                                        for (const sel of selectors) {
-                                            select = document.querySelector(sel);
-                                            if (select) break;
-                                        }
-                                        
-                                        const inputSelectors = [
-                                            '#ctl00_C_ENT_GDT_CODEFld',
-                                            'input[id*="ENT_GDT_CODE"]',
-                                            'input[name*="ENT_GDT_CODE"]'
-                                        ];
-                                        
-                                        let input = null;
-                                        for (const sel of inputSelectors) {
-                                            input = document.querySelector(sel);
-                                            if (input) break;
-                                        }
-                                        
-                                        return select && input && select.options && select.options.length > 0;
+                                        const select = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
+                                        const input = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
+                                        return select && input && select.options.length > 0;
                                     }
                                 """)
                                 
@@ -703,132 +648,61 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                                     break
                                 else:
                                     logger.warning(f"Form not ready, waiting more... (attempt {wait_attempt + 1})")
-                                    await page.wait_for_timeout(15000)
+                                    await page.wait_for_timeout(10000)
                                     
                             except Exception as form_wait_error:
                                 logger.warning(f"Form wait attempt {wait_attempt + 1} failed: {form_wait_error}")
-                                if wait_attempt < 4:
-                                    await page.wait_for_timeout(15000)
+                                if wait_attempt < 2:
+                                    await page.wait_for_timeout(10000)
                                     continue
                                 else:
                                     break
                         
                         if not form_found:
-                            # Debug info
+                            # Debug: Kiểm tra trang hiện tại
                             current_url = page.url
                             page_title = await page.title()
                             logger.error(f"Form not found. Current URL: {current_url}")
                             logger.error(f"Page title: {page_title}")
                             
-                            # Thử reload trang
-                            logger.info("Attempting page reload...")
-                            await page.reload(timeout=180000, wait_until='domcontentloaded')
-                            await page.wait_for_timeout(20000)
+                            # Kiểm tra DOM
+                            dom_info = await page.evaluate("""
+                                () => {
+                                    return {
+                                        hasSelect: !!document.querySelector('select[id*="ANNOUNCEMENT_TYPE"]'),
+                                        hasInput: !!document.querySelector('#ctl00_C_ENT_GDT_CODEFld'),
+                                        formCount: document.querySelectorAll('form').length,
+                                        selectCount: document.querySelectorAll('select').length,
+                                        inputCount: document.querySelectorAll('input').length
+                                    };
+                                }
+                            """)
+                            logger.error(f"DOM info: {dom_info}")
                             
-                            # Thử lại một lần nữa
-                            try:
-                                await page.wait_for_selector('select[id*="ANNOUNCEMENT_TYPE"]', timeout=60000)
-                                logger.info("Form found after reload")
-                            except:
-                                logger.error("Form still not found after reload")
-                                if reg_type != registration_types[-1][0]:
-                                    continue
-                                else:
-                                    raise Exception("Form elements not found on page after all attempts")
+                            raise Exception("Form elements not found on page")
                         
-                        # Step 3: Fill form với dynamic selector detection
+                        # Step 3: Fill form với retry
                         logger.info(f"Filling form with registration type: {reg_name}")
                         
                         for fill_attempt in range(3):
                             try:
                                 logger.info(f"Form fill attempt {fill_attempt + 1}/3")
                                 
-                                # Detect và fill select
-                                select_filled = await page.evaluate(f"""
-                                    () => {{
-                                        const selectors = [
-                                            '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld',
-                                            'select[id*="ANNOUNCEMENT_TYPE"]',
-                                            'select[name*="ANNOUNCEMENT_TYPE"]'
-                                        ];
-                                        
-                                        let select = null;
-                                        for (const sel of selectors) {{
-                                            select = document.querySelector(sel);
-                                            if (select) break;
-                                        }}
-                                        
-                                        if (select) {{
-                                            select.value = '{reg_type}';
-                                            select.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                                            return true;
-                                        }}
-                                        return false;
-                                    }}
-                                """)
+                                # Đợi và fill select
+                                await page.wait_for_selector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', timeout=30000)
+                                await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', reg_type)
+                                await page.wait_for_timeout(5000)  # Tăng timeout
                                 
-                                if not select_filled:
-                                    raise Exception("Could not fill select element")
-                                
-                                await page.wait_for_timeout(8000)  # Đợi response
-                                
-                                # Detect và fill input
-                                input_filled = await page.evaluate(f"""
-                                    () => {{
-                                        const selectors = [
-                                            '#ctl00_C_ENT_GDT_CODEFld',
-                                            'input[id*="ENT_GDT_CODE"]',
-                                            'input[name*="ENT_GDT_CODE"]'
-                                        ];
-                                        
-                                        let input = null;
-                                        for (const sel of selectors) {{
-                                            input = document.querySelector(sel);
-                                            if (input) break;
-                                        }}
-                                        
-                                        if (input) {{
-                                            input.value = '{mst}';
-                                            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                                            input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                                            return true;
-                                        }}
-                                        return false;
-                                    }}
-                                """)
-                                
-                                if not input_filled:
-                                    raise Exception("Could not fill input element")
-                                
+                                # Đợi và fill input
+                                await page.wait_for_selector('#ctl00_C_ENT_GDT_CODEFld', timeout=30000)
+                                await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
                                 await page.wait_for_timeout(3000)
                                 
-                                # Verify form values
+                                # Verify form đã được fill
                                 form_values = await page.evaluate("""
                                     () => {
-                                        const selectSelectors = [
-                                            '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld',
-                                            'select[id*="ANNOUNCEMENT_TYPE"]',
-                                            'select[name*="ANNOUNCEMENT_TYPE"]'
-                                        ];
-                                        
-                                        const inputSelectors = [
-                                            '#ctl00_C_ENT_GDT_CODEFld',
-                                            'input[id*="ENT_GDT_CODE"]',
-                                            'input[name*="ENT_GDT_CODE"]'
-                                        ];
-                                        
-                                        let select = null;
-                                        for (const sel of selectSelectors) {
-                                            select = document.querySelector(sel);
-                                            if (select) break;
-                                        }
-                                        
-                                        let input = null;
-                                        for (const sel of inputSelectors) {
-                                            input = document.querySelector(sel);
-                                            if (input) break;
-                                        }
-                                        
+                                        const select = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
+                                        const input = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
                                         return {
                                             selectValue: select ? select.value : null,
                                             inputValue: input ? input.value : null
@@ -844,7 +718,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                                 else:
                                     logger.warning(f"Form fill verification failed on attempt {fill_attempt + 1}")
                                     if fill_attempt < 2:
-                                        await page.wait_for_timeout(8000)
+                                        await page.wait_for_timeout(5000)
                                         continue
                                     else:
                                         raise Exception("Form fill verification failed")
@@ -852,7 +726,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                             except Exception as fill_error:
                                 logger.error(f"Form fill attempt {fill_attempt + 1} failed: {fill_error}")
                                 if fill_attempt < 2:
-                                    await page.wait_for_timeout(8000)
+                                    await page.wait_for_timeout(5000)
                                     continue
                                 else:
                                     raise fill_error
@@ -861,16 +735,16 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         logger.info("Solving captcha...")
                         captcha_code = None
                         
-                        for captcha_attempt in range(5):  # Tăng số lần thử
+                        for captcha_attempt in range(3):  # Tăng số lần thử
                             try:
                                 captcha_code = await asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL)
                                 logger.info("Captcha solved successfully")
                                 break
                             except Exception as captcha_error:
                                 logger.warning(f"Captcha attempt {captcha_attempt + 1} failed: {captcha_error}")
-                                if captcha_attempt == 4:
+                                if captcha_attempt == 2:
                                     raise captcha_error
-                                await asyncio.sleep(15)  # Đợi lâu hơn
+                                await asyncio.sleep(10)  # Đợi lâu hơn
                         
                         if not captcha_code:
                             raise Exception("Failed to solve captcha")
@@ -880,130 +754,44 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         if not success:
                             raise Exception("Failed to inject captcha response")
                         
-                        await page.wait_for_timeout(8000)
+                        await page.wait_for_timeout(5000)
                         
-                        # Step 6: Submit form với multiple strategies
-                        logger.info("Submitting form...")
-                        
-                        submit_success = False
-                        for submit_attempt in range(3):
+                        # Step 6: Submit form
+                        try:
+                            logger.info("Submitting form...")
+                            await page.click('#ctl00_C_BtnFilter', force=True, timeout=30000)
+                            logger.info("Form submitted successfully")
+                            await page.wait_for_timeout(10000)  # Đợi lâu hơn
+                            
+                        except Exception as submit_error:
+                            logger.error(f"Form submission failed: {submit_error}")
                             try:
-                                # Thử click button
-                                button_selectors = [
-                                    '#ctl00_C_BtnFilter',
-                                    'input[id*="BtnFilter"]',
-                                    'button[id*="BtnFilter"]',
-                                    'input[value*="Tìm kiếm"]',
-                                    'button[value*="Tìm kiếm"]'
-                                ]
-                                
-                                button_clicked = False
-                                for selector in button_selectors:
-                                    try:
-                                        await page.click(selector, force=True, timeout=30000)
-                                        button_clicked = True
-                                        logger.info(f"Form submitted with selector: {selector}")
-                                        break
-                                    except:
-                                        continue
-                                
-                                if not button_clicked:
-                                    # Thử submit bằng JavaScript
-                                    await page.evaluate("""
-                                        () => {
-                                            const selectors = [
-                                                '#ctl00_C_BtnFilter',
-                                                'input[id*="BtnFilter"]',
-                                                'button[id*="BtnFilter"]'
-                                            ];
-                                            
-                                            for (const sel of selectors) {
-                                                const btn = document.querySelector(sel);
-                                                if (btn) {
-                                                    btn.click();
-                                                    return;
-                                                }
-                                            }
-                                            
-                                            // Fallback: submit form
-                                            const form = document.querySelector('form');
-                                            if (form) form.submit();
-                                        }
-                                    """)
-                                    logger.info("Form submitted via JavaScript")
-                                
-                                submit_success = True
-                                break
-                                
-                            except Exception as submit_error:
-                                logger.warning(f"Submit attempt {submit_attempt + 1} failed: {submit_error}")
-                                if submit_attempt < 2:
-                                    await page.wait_for_timeout(5000)
-                                    continue
-                                else:
-                                    raise submit_error
+                                await page.evaluate("""
+                                    () => {
+                                        const btn = document.getElementById('ctl00_C_BtnFilter');
+                                        if (btn) btn.click();
+                                    }
+                                """)
+                                logger.info("Form submitted via JavaScript")
+                                await page.wait_for_timeout(10000)
+                            except:
+                                raise submit_error
                         
-                        if not submit_success:
-                            raise Exception("Failed to submit form")
-                        
-                        await page.wait_for_timeout(15000)  # Đợi kết quả
-                        
-                        # Step 7: Wait for results với multiple strategies
+                        # Step 7: Wait for results với timeout dài hơn
                         logger.info("Waiting for results...")
                         
-                        results_found = False
-                        for result_attempt in range(3):
-                            try:
-                                # Thử đợi các selector khác nhau
-                                result_selectors = [
-                                    '#ctl00_C_CtlList',
-                                    'table[id*="CtlList"]',
-                                    'div[id*="CtlList"]',
-                                    'text=Không tìm thấy dữ liệu'
-                                ]
-                                
-                                for selector in result_selectors:
-                                    try:
-                                        await page.wait_for_selector(selector, timeout=60000)
-                                        logger.info(f"Results found with selector: {selector}")
-                                        results_found = True
-                                        break
-                                    except:
-                                        continue
-                                
-                                if results_found:
-                                    break
-                                    
-                                logger.warning(f"Results attempt {result_attempt + 1} failed, retrying...")
-                                await page.wait_for_timeout(10000)
-                                
-                            except Exception as result_error:
-                                logger.warning(f"Result wait attempt {result_attempt + 1} failed: {result_error}")
-                                if result_attempt < 2:
-                                    await page.wait_for_timeout(10000)
-                                    continue
+                        try:
+                            await page.wait_for_selector('#ctl00_C_CtlList, text=Không tìm thấy dữ liệu', timeout=120000)  # 2 phút
+                            logger.info("Results found")
+                        except:
+                            logger.warning("Results timeout, continuing anyway")
+                            await page.wait_for_timeout(15000)
                         
-                        # Kiểm tra có dữ liệu không
-                        has_data = await page.evaluate("""
-                            () => {
-                                const selectors = [
-                                    '#ctl00_C_CtlList',
-                                    'table[id*="CtlList"]',
-                                    'div[id*="CtlList"]'
-                                ];
-                                
-                                for (const sel of selectors) {
-                                    const element = document.querySelector(sel);
-                                    if (element && element.textContent.trim().length > 0) {
-                                        return true;
-                                    }
-                                }
-                                
-                                return false;
-                            }
-                        """)
-                        
-                        if not has_data:
+                        # Kiểm tra kết quả
+                        try:
+                            await page.wait_for_selector('#ctl00_C_CtlList', timeout=30000)
+                            logger.info("Results table found")
+                        except:
                             logger.info(f"No results found for {reg_name}, trying next registration type...")
                             continue
                         
@@ -1012,11 +800,9 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         
                         pdf_selectors = [
                             'input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]',
-                            'input[id*="LnkGetPDFActive"]',
                             'a[href*="pdf"]',
                             'input[value*="PDF"]',
-                            'button[onclick*="pdf"]',
-                            'a[onclick*="pdf"]'
+                            'button[onclick*="pdf"]'
                         ]
                         
                         pdf_button = None
@@ -1044,7 +830,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         download_path = os.path.join(os.getcwd(), file_name)
                         
                         try:
-                            async with page.expect_download(timeout=300000) as download_info:  # 5 phút
+                            async with page.expect_download(timeout=180000) as download_info:  # 3 phút
                                 await pdf_button.click()
                                 logger.info("Clicked PDF download button")
                             
@@ -1084,7 +870,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                 raise Exception(f"All {max_retries} attempts failed. Last error: {e}")
             
             # Exponential backoff
-            wait_time = min(2 ** attempt * 10, 60)  # Max 60 giây
+            wait_time = min(2 ** attempt, 30)  # Max 30 giây
             logger.info(f"Waiting {wait_time} seconds before retry...")
             await asyncio.sleep(wait_time)
             
