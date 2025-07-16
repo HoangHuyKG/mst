@@ -496,9 +496,8 @@ async def inject_captcha_response(page, captcha_code):
     except Exception as e:
         logger.error(f"Injection failed: {e}")
         return False
-
 async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
-    """Optimized crawl function for server environment"""
+    """Optimized crawl function for Railway.com deployment"""
     browser = None
     
     # Danh sách các loại đăng ký để thử theo thứ tự
@@ -512,7 +511,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
             logger.info(f"Attempt {attempt + 1}/{max_retries} for MST: {mst}")
             
             async with async_playwright() as p:
-                # Cấu hình browser tối ưu cho server
+                # Cấu hình browser tối ưu cho Railway
                 browser = await p.chromium.launch(
                     headless=True,
                     args=[
@@ -528,35 +527,58 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         '--disable-blink-features=AutomationControlled',
                         '--disable-web-security',
                         '--memory-pressure-off',
-                        '--max_old_space_size=4096',
-                        '--single-process',  # Giảm memory usage
-                        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                        '--max_old_space_size=2048',  # Giảm memory usage cho Railway
+                        '--single-process',
+                        '--no-zygote',
+                        '--disable-accelerated-2d-canvas',
+                        '--disable-accelerated-jpeg-decoding',
+                        '--disable-accelerated-mjpeg-decode',
+                        '--disable-accelerated-video-decode',
+                        '--disable-background-networking',
+                        '--disable-sync',
+                        '--disable-translate',
+                        '--disable-extensions',
+                        '--disable-plugins',
+                        '--disable-default-apps',
+                        '--disable-component-extensions-with-background-pages',
+                        '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                     ]
                 )
                 
                 context = await browser.new_context(
-                    viewport={'width': 1366, 'height': 768},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    viewport={'width': 1280, 'height': 720},  # Giảm resolution
+                    user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                     extra_http_headers={
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                         'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
                         'Accept-Encoding': 'gzip, deflate, br',
                         'Connection': 'keep-alive',
-                        'Upgrade-Insecure-Requests': '1'
+                        'Upgrade-Insecure-Requests': '1',
+                        'Cache-Control': 'max-age=0'
                     },
                     ignore_https_errors=True,
                     java_script_enabled=True,
                     bypass_csp=True
                 )
                 
-                # Tăng timeout cho server
-                context.set_default_timeout(120000)  # 2 phút
+                # Giảm timeout để tránh Railway timeout
+                context.set_default_timeout(90000)  # 1.5 phút
                 
-                # Chặn tài nguyên không cần thiết
+                # Chặn tài nguyên không cần thiết - quan trọng cho Railway
                 async def handle_route(route):
                     try:
                         resource_type = route.request.resource_type
-                        if resource_type in ["image", "media", "font", "stylesheet"]:
+                        url = route.request.url
+                        
+                        # Chặn nhiều loại tài nguyên hơn
+                        if resource_type in ["image", "media", "font", "stylesheet", "websocket"]:
+                            await route.abort()
+                        # Chặn các domain quảng cáo và analytics
+                        elif any(domain in url for domain in [
+                            'google-analytics.com', 'googletagmanager.com', 'facebook.com',
+                            'doubleclick.net', 'googlesyndication.com', 'amazon-adsystem.com',
+                            'adsystem.amazon.com', 'ads.yahoo.com', 'twitter.com'
+                        ]):
                             await route.abort()
                         else:
                             await route.continue_()
@@ -570,14 +592,17 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                 await context.route("**/*", handle_route)
                 
                 page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 phút
+                page.set_default_timeout(90000)  # 1.5 phút
                 
                 # Error handlers
                 def handle_page_error_sync(error):
                     logger.error(f"Page error: {error}")
 
                 def handle_console_sync(msg):
-                    if msg.type == "error" and any(err in msg.text for err in ["net::ERR_FAILED", "net::ERR_ABORTED", "net::ERR_BLOCKED_BY_CLIENT"]):
+                    if msg.type == "error" and any(err in msg.text for err in [
+                        "net::ERR_FAILED", "net::ERR_ABORTED", "net::ERR_BLOCKED_BY_CLIENT",
+                        "net::ERR_NETWORK_CHANGED", "net::ERR_INTERNET_DISCONNECTED"
+                    ]):
                         return
                     if msg.type == "error":
                         logger.info(f"Console: {msg.text}")
@@ -590,18 +615,18 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                     logger.info(f"Trying registration type: {reg_name} ({reg_type})")
                     
                     try:
-                        # Step 1: Navigate với retry logic và timeout dài hơn
+                        # Step 1: Navigate với strategy mới cho Railway
                         logger.info(f"Navigating to target URL for MST: {mst}")
                         
-                        for nav_attempt in range(3):
+                        for nav_attempt in range(2):  # Giảm số lần thử
                             try:
-                                logger.info(f"Navigation attempt {nav_attempt + 1}/3")
+                                logger.info(f"Navigation attempt {nav_attempt + 1}/2")
                                 
-                                # Timeout dài hơn cho server
+                                # Sử dụng domcontentloaded thay vì load để nhanh hơn
                                 response = await page.goto(
                                     TARGET_URL, 
-                                    timeout=120000,  # 2 phút
-                                    wait_until='load'  # Đợi network idle thay vì load
+                                    timeout=90000,  # 1.5 phút
+                                    wait_until='domcontentloaded'  # Nhanh hơn 'load'
                                 )
                                 
                                 if response and response.status >= 400:
@@ -610,28 +635,42 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                                 
                                 logger.info(f"Successfully navigated to target URL. Status: {response.status if response else 'Unknown'}")
                                 
-                                # Đợi JavaScript load hoàn toàn
-                                await page.wait_for_timeout(10000)  # Tăng từ 5s lên 10s
-                                break
+                                # Đợi JavaScript load - giảm thời gian đợi
+                                await page.wait_for_timeout(5000)  # Giảm từ 10s xuống 5s
+                                
+                                # Kiểm tra xem trang đã load chưa
+                                page_ready = await page.evaluate("""
+                                    () => {
+                                        return document.readyState === 'complete' || 
+                                               document.readyState === 'interactive';
+                                    }
+                                """)
+                                
+                                if page_ready:
+                                    logger.info("Page is ready")
+                                    break
+                                else:
+                                    logger.warning("Page not ready, waiting more...")
+                                    await page.wait_for_timeout(5000)
+                                    break
                                 
                             except Exception as nav_error:
                                 logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
-                                if nav_attempt == 2:
+                                if nav_attempt == 1:
                                     logger.error("All navigation attempts failed")
                                     raise nav_error
-                                await asyncio.sleep(5)  # Đợi lâu hơn
+                                await asyncio.sleep(3)  # Giảm thời gian đợi
                         
-                        # Step 2: Wait for form elements với nhiều strategies
+                        # Step 2: Wait for form elements với timeout ngắn hơn
                         logger.info("Waiting for form elements...")
                         
-                        # Đợi lâu hơn cho form elements
                         form_found = False
-                        for wait_attempt in range(3):
+                        for wait_attempt in range(2):  # Giảm số lần thử
                             try:
-                                logger.info(f"Form wait attempt {wait_attempt + 1}/3")
+                                logger.info(f"Form wait attempt {wait_attempt + 1}/2")
                                 
-                                # Đợi select dropdown xuất hiện
-                                await page.wait_for_selector('select[id*="ANNOUNCEMENT_TYPE"]', timeout=60000)
+                                # Đợi select dropdown xuất hiện với timeout ngắn hơn
+                                await page.wait_for_selector('select[id*="ANNOUNCEMENT_TYPE"]', timeout=45000)
                                 
                                 # Kiểm tra xem form đã ready chưa
                                 form_ready = await page.evaluate("""
@@ -648,12 +687,12 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                                     break
                                 else:
                                     logger.warning(f"Form not ready, waiting more... (attempt {wait_attempt + 1})")
-                                    await page.wait_for_timeout(10000)
+                                    await page.wait_for_timeout(5000)
                                     
                             except Exception as form_wait_error:
                                 logger.warning(f"Form wait attempt {wait_attempt + 1} failed: {form_wait_error}")
-                                if wait_attempt < 2:
-                                    await page.wait_for_timeout(10000)
+                                if wait_attempt < 1:
+                                    await page.wait_for_timeout(5000)
                                     continue
                                 else:
                                     break
@@ -665,38 +704,41 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                             logger.error(f"Form not found. Current URL: {current_url}")
                             logger.error(f"Page title: {page_title}")
                             
-                            # Kiểm tra DOM
-                            dom_info = await page.evaluate("""
-                                () => {
-                                    return {
-                                        hasSelect: !!document.querySelector('select[id*="ANNOUNCEMENT_TYPE"]'),
-                                        hasInput: !!document.querySelector('#ctl00_C_ENT_GDT_CODEFld'),
-                                        formCount: document.querySelectorAll('form').length,
-                                        selectCount: document.querySelectorAll('select').length,
-                                        inputCount: document.querySelectorAll('input').length
-                                    };
-                                }
-                            """)
-                            logger.error(f"DOM info: {dom_info}")
+                            # Kiểm tra DOM với timeout ngắn
+                            try:
+                                dom_info = await page.evaluate("""
+                                    () => {
+                                        return {
+                                            hasSelect: !!document.querySelector('select[id*="ANNOUNCEMENT_TYPE"]'),
+                                            hasInput: !!document.querySelector('#ctl00_C_ENT_GDT_CODEFld'),
+                                            formCount: document.querySelectorAll('form').length,
+                                            selectCount: document.querySelectorAll('select').length,
+                                            inputCount: document.querySelectorAll('input').length
+                                        };
+                                    }
+                                """)
+                                logger.error(f"DOM info: {dom_info}")
+                            except Exception as dom_error:
+                                logger.error(f"DOM evaluation failed: {dom_error}")
                             
                             raise Exception("Form elements not found on page")
                         
-                        # Step 3: Fill form với retry
+                        # Step 3: Fill form với retry ngắn hơn
                         logger.info(f"Filling form with registration type: {reg_name}")
                         
-                        for fill_attempt in range(3):
+                        for fill_attempt in range(2):  # Giảm số lần thử
                             try:
-                                logger.info(f"Form fill attempt {fill_attempt + 1}/3")
+                                logger.info(f"Form fill attempt {fill_attempt + 1}/2")
                                 
                                 # Đợi và fill select
                                 await page.wait_for_selector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', timeout=30000)
                                 await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', reg_type)
-                                await page.wait_for_timeout(5000)  # Tăng timeout
+                                await page.wait_for_timeout(3000)  # Giảm timeout
                                 
                                 # Đợi và fill input
                                 await page.wait_for_selector('#ctl00_C_ENT_GDT_CODEFld', timeout=30000)
                                 await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
-                                await page.wait_for_timeout(3000)
+                                await page.wait_for_timeout(2000)  # Giảm timeout
                                 
                                 # Verify form đã được fill
                                 form_values = await page.evaluate("""
@@ -717,34 +759,42 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                                     break
                                 else:
                                     logger.warning(f"Form fill verification failed on attempt {fill_attempt + 1}")
-                                    if fill_attempt < 2:
-                                        await page.wait_for_timeout(5000)
+                                    if fill_attempt < 1:
+                                        await page.wait_for_timeout(3000)
                                         continue
                                     else:
                                         raise Exception("Form fill verification failed")
                                         
                             except Exception as fill_error:
                                 logger.error(f"Form fill attempt {fill_attempt + 1} failed: {fill_error}")
-                                if fill_attempt < 2:
-                                    await page.wait_for_timeout(5000)
+                                if fill_attempt < 1:
+                                    await page.wait_for_timeout(3000)
                                     continue
                                 else:
                                     raise fill_error
                         
-                        # Step 4: Solve captcha
+                        # Step 4: Solve captcha với timeout ngắn hơn
                         logger.info("Solving captcha...")
                         captcha_code = None
                         
-                        for captcha_attempt in range(3):  # Tăng số lần thử
+                        for captcha_attempt in range(2):  # Giảm số lần thử
                             try:
-                                captcha_code = await asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL)
+                                # Sử dụng asyncio.wait_for để set timeout cho captcha solving
+                                captcha_code = await asyncio.wait_for(
+                                    asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL),
+                                    timeout=60.0  # 1 phút timeout
+                                )
                                 logger.info("Captcha solved successfully")
                                 break
+                            except asyncio.TimeoutError:
+                                logger.warning(f"Captcha solving timeout on attempt {captcha_attempt + 1}")
+                                if captcha_attempt == 1:
+                                    raise Exception("Captcha solving timeout")
                             except Exception as captcha_error:
                                 logger.warning(f"Captcha attempt {captcha_attempt + 1} failed: {captcha_error}")
-                                if captcha_attempt == 2:
+                                if captcha_attempt == 1:
                                     raise captcha_error
-                                await asyncio.sleep(10)  # Đợi lâu hơn
+                                await asyncio.sleep(5)  # Giảm thời gian đợi
                         
                         if not captcha_code:
                             raise Exception("Failed to solve captcha")
@@ -754,14 +804,14 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         if not success:
                             raise Exception("Failed to inject captcha response")
                         
-                        await page.wait_for_timeout(5000)
+                        await page.wait_for_timeout(3000)  # Giảm timeout
                         
                         # Step 6: Submit form
                         try:
                             logger.info("Submitting form...")
                             await page.click('#ctl00_C_BtnFilter', force=True, timeout=30000)
                             logger.info("Form submitted successfully")
-                            await page.wait_for_timeout(10000)  # Đợi lâu hơn
+                            await page.wait_for_timeout(5000)  # Giảm timeout
                             
                         except Exception as submit_error:
                             logger.error(f"Form submission failed: {submit_error}")
@@ -773,23 +823,23 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                                     }
                                 """)
                                 logger.info("Form submitted via JavaScript")
-                                await page.wait_for_timeout(10000)
+                                await page.wait_for_timeout(5000)
                             except:
                                 raise submit_error
                         
-                        # Step 7: Wait for results với timeout dài hơn
+                        # Step 7: Wait for results với timeout ngắn hơn
                         logger.info("Waiting for results...")
                         
                         try:
-                            await page.wait_for_selector('#ctl00_C_CtlList, text=Không tìm thấy dữ liệu', timeout=120000)  # 2 phút
+                            await page.wait_for_selector('#ctl00_C_CtlList, text=Không tìm thấy dữ liệu', timeout=60000)  # 1 phút
                             logger.info("Results found")
                         except:
                             logger.warning("Results timeout, continuing anyway")
-                            await page.wait_for_timeout(15000)
+                            await page.wait_for_timeout(5000)
                         
                         # Kiểm tra kết quả
                         try:
-                            await page.wait_for_selector('#ctl00_C_CtlList', timeout=30000)
+                            await page.wait_for_selector('#ctl00_C_CtlList', timeout=20000)
                             logger.info("Results table found")
                         except:
                             logger.info(f"No results found for {reg_name}, trying next registration type...")
@@ -823,14 +873,14 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                             else:
                                 continue
                         
-                        # Step 9: Download PDF
+                        # Step 9: Download PDF với timeout ngắn hơn
                         logger.info(f"Downloading PDF for {reg_name}...")
                         
                         file_name = f"{mst}_{reg_type}_{uuid.uuid4().hex[:8]}.pdf"
                         download_path = os.path.join(os.getcwd(), file_name)
                         
                         try:
-                            async with page.expect_download(timeout=180000) as download_info:  # 3 phút
+                            async with page.expect_download(timeout=120000) as download_info:  # 2 phút
                                 await pdf_button.click()
                                 logger.info("Clicked PDF download button")
                             
@@ -869,8 +919,8 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
             if attempt == max_retries - 1:
                 raise Exception(f"All {max_retries} attempts failed. Last error: {e}")
             
-            # Exponential backoff
-            wait_time = min(2 ** attempt, 30)  # Max 30 giây
+            # Exponential backoff ngắn hơn
+            wait_time = min(2 ** attempt, 15)  # Max 15 giây
             logger.info(f"Waiting {wait_time} seconds before retry...")
             await asyncio.sleep(wait_time)
             
