@@ -601,7 +601,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                                 response = await page.goto(
                                     TARGET_URL, 
                                     timeout=120000,  # 2 phút
-                                    wait_until='networkidle'  # Đợi network idle thay vì load
+                                    wait_until='load'  # Đợi network idle thay vì load
                                 )
                                 
                                 if response and response.status >= 400:
