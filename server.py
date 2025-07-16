@@ -620,63 +620,208 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                     logger.info(f"Trying: {reg_name}")
                     
                     try:
-                        # Step 1: Navigate nhanh
+                        # Step 1: Navigate với retry strategy
                         logger.info(f"Navigating for MST: {mst}")
                         
-                        response = await page.goto(
-                            TARGET_URL, 
-                            timeout=60000,  # 1 phút
-                            wait_until='domcontentloaded'
-                        )
+                        navigation_success = False
+                        for nav_attempt in range(3):  # 3 lần thử navigate
+                            try:
+                                logger.info(f"Navigation attempt {nav_attempt + 1}/3")
+                                
+                                # Thử với domcontentloaded trước
+                                if nav_attempt == 0:
+                                    response = await page.goto(
+                                        TARGET_URL, 
+                                        timeout=45000,  # 45s
+                                        wait_until='domcontentloaded'
+                                    )
+                                # Thử với networkidle
+                                elif nav_attempt == 1:
+                                    response = await page.goto(
+                                        TARGET_URL, 
+                                        timeout=30000,  # 30s 
+                                        wait_until='networkidle'
+                                    )
+                                # Thử với load cuối cùng
+                                else:
+                                    response = await page.goto(
+                                        TARGET_URL, 
+                                        timeout=20000,  # 20s
+                                        wait_until='load'
+                                    )
+                                
+                                if response and response.status >= 400:
+                                    logger.warning(f"HTTP {response.status} on attempt {nav_attempt + 1}")
+                                    if nav_attempt < 2:
+                                        await asyncio.sleep(2)
+                                        continue
+                                    else:
+                                        raise Exception(f"HTTP {response.status}")
+                                
+                                logger.info(f"Navigation OK: {response.status if response else 'Unknown'}")
+                                navigation_success = True
+                                break
+                                
+                            except Exception as nav_error:
+                                logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
+                                if nav_attempt < 2:
+                                    await asyncio.sleep(3)  # Đợi 3s trước khi thử lại
+                                    continue
+                                else:
+                                    logger.error(f"All navigation attempts failed: {nav_error}")
+                                    raise nav_error
                         
-                        if response and response.status >= 400:
-                            raise Exception(f"HTTP {response.status}")
+                        if not navigation_success:
+                            raise Exception("Navigation failed after all attempts")
                         
-                        logger.info(f"Navigation OK: {response.status if response else 'Unknown'}")
+                        # Đợi ngắn hơn nhưng có kiểm tra
+                        await page.wait_for_timeout(2000)  # 2 giây
                         
-                        # Đợi ngắn hơn
-                        await page.wait_for_timeout(3000)  # 3 giây
-                        
-                        # Step 2: Wait for form - timeout ngắn
-                        logger.info("Waiting for form...")
-                        
+                        # Kiểm tra trang đã load đúng chưa
                         try:
-                            await page.wait_for_selector('select[id*="ANNOUNCEMENT_TYPE"]', timeout=30000)
-                            
-                            # Kiểm tra form ready
-                            form_ready = await page.evaluate("""
+                            page_check = await page.evaluate("""
                                 () => {
-                                    const select = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
-                                    const input = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
-                                    return select && input && select.options.length > 0;
+                                    return {
+                                        title: document.title,
+                                        url: window.location.href,
+                                        hasForm: !!document.querySelector('form'),
+                                        readyState: document.readyState
+                                    };
                                 }
                             """)
+                            logger.info(f"Page check: {page_check}")
                             
-                            if not form_ready:
-                                await page.wait_for_timeout(3000)
+                            if 'egazette' not in page_check['url']:
+                                logger.warning("Wrong page loaded, retrying...")
+                                continue
                                 
-                        except Exception as form_error:
-                            logger.error(f"Form wait failed: {form_error}")
+                        except Exception as check_error:
+                            logger.warning(f"Page check failed: {check_error}")
+                            await page.wait_for_timeout(2000)
+                        
+                        # Step 2: Wait for form với multiple strategies
+                        logger.info("Waiting for form...")
+                        
+                        form_ready = False
+                        for form_attempt in range(3):  # 3 lần thử
+                            try:
+                                logger.info(f"Form wait attempt {form_attempt + 1}/3")
+                                
+                                # Strategy 1: Wait for select với timeout ngắn
+                                if form_attempt == 0:
+                                    await page.wait_for_selector('select[id*="ANNOUNCEMENT_TYPE"]', timeout=20000)
+                                # Strategy 2: Wait for specific ID
+                                elif form_attempt == 1:
+                                    await page.wait_for_selector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', timeout=15000)
+                                # Strategy 3: Wait for any select
+                                else:
+                                    await page.wait_for_selector('select', timeout=10000)
+                                
+                                # Kiểm tra form ready
+                                form_check = await page.evaluate("""
+                                    () => {
+                                        const select = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
+                                        const input = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
+                                        return {
+                                            hasSelect: !!select,
+                                            hasInput: !!input,
+                                            selectOptions: select ? select.options.length : 0,
+                                            selectValue: select ? select.value : null
+                                        };
+                                    }
+                                """)
+                                
+                                logger.info(f"Form check: {form_check}")
+                                
+                                if form_check['hasSelect'] and form_check['hasInput'] and form_check['selectOptions'] > 0:
+                                    logger.info("Form is ready")
+                                    form_ready = True
+                                    break
+                                else:
+                                    logger.warning(f"Form not ready on attempt {form_attempt + 1}")
+                                    if form_attempt < 2:
+                                        await page.wait_for_timeout(3000)
+                                        continue
+                                        
+                            except Exception as form_error:
+                                logger.warning(f"Form wait attempt {form_attempt + 1} failed: {form_error}")
+                                if form_attempt < 2:
+                                    await page.wait_for_timeout(2000)
+                                    continue
+                                else:
+                                    break
+                        
+                        if not form_ready:
+                            logger.error("Form not ready after all attempts")
                             continue
                         
-                        # Step 3: Fill form nhanh
+                        # Step 3: Fill form với retry
                         logger.info(f"Filling form: {reg_name}")
                         
-                        try:
-                            # Fill select
-                            await page.wait_for_selector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', timeout=20000)
-                            await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', reg_type)
-                            await page.wait_for_timeout(1000)
-                            
-                            # Fill input
-                            await page.wait_for_selector('#ctl00_C_ENT_GDT_CODEFld', timeout=20000)
-                            await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
-                            await page.wait_for_timeout(1000)
-                            
-                            logger.info("Form filled")
-                            
-                        except Exception as fill_error:
-                            logger.error(f"Form fill failed: {fill_error}")
+                        form_filled = False
+                        for fill_attempt in range(2):  # 2 lần thử
+                            try:
+                                logger.info(f"Form fill attempt {fill_attempt + 1}/2")
+                                
+                                # Fill select với wait
+                                select_selector = '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld'
+                                await page.wait_for_selector(select_selector, timeout=15000)
+                                
+                                # Clear và fill select
+                                await page.evaluate(f"""
+                                    () => {{
+                                        const select = document.querySelector('{select_selector}');
+                                        if (select) {{
+                                            select.value = '{reg_type}';
+                                            select.dispatchEvent(new Event('change'));
+                                        }}
+                                    }}
+                                """)
+                                await page.wait_for_timeout(1000)
+                                
+                                # Fill input với wait
+                                input_selector = '#ctl00_C_ENT_GDT_CODEFld'
+                                await page.wait_for_selector(input_selector, timeout=15000)
+                                
+                                # Clear và fill input
+                                await page.fill(input_selector, '')  # Clear trước
+                                await page.fill(input_selector, mst)
+                                await page.wait_for_timeout(1000)
+                                
+                                # Verify form filled
+                                verify_result = await page.evaluate("""
+                                    () => {
+                                        const select = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
+                                        const input = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
+                                        return {
+                                            selectValue: select ? select.value : null,
+                                            inputValue: input ? input.value : null
+                                        };
+                                    }
+                                """)
+                                
+                                logger.info(f"Form values: {verify_result}")
+                                
+                                if verify_result['selectValue'] == reg_type and verify_result['inputValue'] == mst:
+                                    logger.info("Form filled successfully")
+                                    form_filled = True
+                                    break
+                                else:
+                                    logger.warning(f"Form fill verification failed on attempt {fill_attempt + 1}")
+                                    if fill_attempt < 1:
+                                        await page.wait_for_timeout(2000)
+                                        continue
+                                    
+                            except Exception as fill_error:
+                                logger.error(f"Form fill attempt {fill_attempt + 1} failed: {fill_error}")
+                                if fill_attempt < 1:
+                                    await page.wait_for_timeout(2000)
+                                    continue
+                                else:
+                                    break
+                        
+                        if not form_filled:
+                            logger.error("Form fill failed after all attempts")
                             continue
                         
                         # Step 4: Solve captcha nhanh
