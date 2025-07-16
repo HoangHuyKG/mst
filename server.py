@@ -496,6 +496,7 @@ async def inject_captcha_response(page, captcha_code):
     except Exception as e:
         logger.error(f"Injection failed: {e}")
         return False
+    
 async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
     """Ultra-optimized crawl function for Railway.com trial deployment"""
     browser = None
@@ -571,36 +572,35 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                 # Giảm timeout cho Railway trial
                 context.set_default_timeout(60000)  # 1 phút
                 
-                # Chặn tài nguyên không cần thiết - quan trọng cho Railway trial
+                # Chặn tài nguyên không cần thiết - với cleanup tốt hơn
+                blocked_resources = {"image", "media", "font", "stylesheet", "websocket", "eventsource"}
+                blocked_domains = ['analytics', 'tracking', 'ads', 'facebook', 'google-analytics',
+                                 'googletagmanager', 'doubleclick', 'googlesyndication',
+                                 'amazon-adsystem', 'twitter', 'linkedin', 'pinterest']
+                
                 async def handle_route(route):
                     try:
                         resource_type = route.request.resource_type
                         url = route.request.url
                         
-                        # Chặn tất cả tài nguyên không cần thiết
-                        if resource_type in ["image", "media", "font", "stylesheet", "websocket", "eventsource"]:
+                        # Chặn tài nguyên không cần thiết
+                        if resource_type in blocked_resources:
                             await route.abort()
-                        # Chặn các domain tracking/ads
-                        elif any(domain in url for domain in [
-                            'analytics', 'tracking', 'ads', 'facebook', 'google-analytics',
-                            'googletagmanager', 'doubleclick', 'googlesyndication',
-                            'amazon-adsystem', 'twitter', 'linkedin', 'pinterest'
-                        ]):
+                        # Chặn domain tracking/ads
+                        elif any(domain in url for domain in blocked_domains):
                             await route.abort()
                         else:
                             await route.continue_()
                     except Exception:
-                        try:
-                            await route.continue_()
-                        except:
-                            pass
+                        # Nếu route đã bị hủy, không thử tiếp
+                        pass
 
                 await context.route("**/*", handle_route)
                 
                 page = await context.new_page()
                 page.set_default_timeout(60000)  # 1 phút
                 
-                # Minimal error handlers
+                # Minimal error handlers với cleanup
                 def handle_page_error_sync(error):
                     if "net::ERR_" not in str(error):
                         logger.error(f"Page error: {error}")
@@ -611,6 +611,9 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
 
                 page.on("pageerror", handle_page_error_sync)
                 page.on("console", handle_console_sync)
+                
+                # Thêm cleanup handler cho page
+                page.on("close", lambda: logger.info("Page closed"))
                 
                 # Thử từng loại đăng ký
                 for reg_type, reg_name in registration_types:
@@ -766,6 +769,15 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                             
                             if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
                                 logger.info(f"PDF downloaded: {file_name} ({os.path.getsize(download_path)} bytes)")
+                                
+                                # Cleanup trước khi return
+                                try:
+                                    await context.unroute("**/*")
+                                    await page.close()
+                                    await context.close()
+                                except:
+                                    pass
+                                
                                 return file_name
                             else:
                                 logger.error("Empty PDF file")
@@ -792,10 +804,36 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
             await asyncio.sleep(wait_time)
             
         finally:
+            # Cleanup tốt hơn để tránh pending tasks
             if browser:
                 try:
+                    # Đóng tất cả pages trước
+                    contexts = browser.contexts
+                    for context in contexts:
+                        try:
+                            # Xóa route handlers trước khi đóng
+                            await context.unroute("**/*")
+                            
+                            # Đóng tất cả pages
+                            for page in context.pages:
+                                try:
+                                    await page.close()
+                                except:
+                                    pass
+                            
+                            # Đóng context
+                            await context.close()
+                        except:
+                            pass
+                    
+                    # Đóng browser
                     await browser.close()
-                except:
+                    
+                    # Đợi một chút để cleanup hoàn tất
+                    await asyncio.sleep(0.1)
+                    
+                except Exception as cleanup_error:
+                    logger.warning(f"Cleanup warning: {cleanup_error}")
                     pass
 
 
