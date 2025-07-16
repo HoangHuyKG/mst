@@ -543,7 +543,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
             )
                 
                 # Set timeout cho context sau khi tạo
-                context.set_default_timeout(180000)  # 3 phút
+                context.set_default_timeout(60000)  # 3 phút
                 
                 # Chặn tài nguyên không cần thiết nhưng giữ lại CSS, JS và các tài nguyên quan trọng
                 async def handle_route(route):
@@ -565,7 +565,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                 page = await context.new_page()
                 
                 # Set timeout cho page
-                page.set_default_timeout(180000)  # 3 phút
+                page.set_default_timeout(60000)  # 3 phút
                 
                 # Thêm error handlers
                 # Thêm error handlers với exception handling
@@ -600,10 +600,9 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                                 # Thử truy cập trang
                                 response = await page.goto(
                                     TARGET_URL, 
-                                    timeout=180000, 
-                                    wait_until='networkidle'
+                                    timeout=60000,  # Giảm timeout xuống 1 phút
+                                    wait_until='domcontentloaded'  # ✅ Nhanh hơn, ổn định hơn
                                 )
-                                
                                 # Kiểm tra response status
                                 if response and response.status >= 400:
                                     logger.error(f"HTTP error: {response.status}")
@@ -723,7 +722,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
                         # Step 7: Wait for results
                         logger.info("Waiting for results...")
                         
-                        await page.wait_for_load_state('networkidle', timeout=120000)
+                        await page.wait_for_load_state('load', timeout=120000)
                         
                         # Check for results table
                         try:
