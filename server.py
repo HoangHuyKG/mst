@@ -497,10 +497,10 @@ async def inject_captcha_response(page, captcha_code):
         logger.error(f"Injection failed: {e}")
         return False
  async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
-    """Railway-optimized crawl function with strict resource management"""
+    """Ultra-optimized crawl function for Railway.com trial deployment"""
     browser = None
     
-    # Danh sách các loại đăng ký để thử theo thứ tự
+    # Chỉ thử loại đăng ký có khả năng thành công cao nhất trước
     registration_types = [
         ('NEW', 'Đăng ký mới'),
         ('AMEND', 'Đăng ký thay đổi')
@@ -511,7 +511,7 @@ async def inject_captcha_response(page, captcha_code):
             logger.info(f"Attempt {attempt + 1}/{max_retries} for MST: {mst}")
             
             async with async_playwright() as p:
-                # Cấu hình browser tối ưu hơn cho Railway free tier
+                # Cấu hình browser siêu tối ưu cho Railway trial
                 browser = await p.chromium.launch(
                     headless=True,
                     args=[
@@ -520,15 +520,20 @@ async def inject_captcha_response(page, captcha_code):
                         '--disable-dev-shm-usage',
                         '--disable-gpu',
                         '--disable-software-rasterizer',
-                        '--single-process',
-                        '--no-zygote',
-                        '--memory-pressure-off',
-                        '--max_old_space_size=256',  # Giảm xuống 256MB
                         '--disable-background-timer-throttling',
                         '--disable-backgrounding-occluded-windows',
                         '--disable-renderer-backgrounding',
+                        '--disable-features=TranslateUI',
+                        '--disable-blink-features=AutomationControlled',
                         '--disable-web-security',
-                        '--disable-features=TranslateUI,VizDisplayCompositor',
+                        '--memory-pressure-off',
+                        '--max_old_space_size=1024',  # Giảm xuống 1GB cho trial
+                        '--single-process',
+                        '--no-zygote',
+                        '--disable-accelerated-2d-canvas',
+                        '--disable-accelerated-jpeg-decoding',
+                        '--disable-accelerated-mjpeg-decode',
+                        '--disable-accelerated-video-decode',
                         '--disable-background-networking',
                         '--disable-sync',
                         '--disable-translate',
@@ -536,43 +541,57 @@ async def inject_captcha_response(page, captcha_code):
                         '--disable-plugins',
                         '--disable-default-apps',
                         '--disable-component-extensions-with-background-pages',
-                        '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-                    ],
-                    timeout=30000  # Giảm timeout launch
+                        '--disable-logging',
+                        '--disable-permissions-api',
+                        '--disable-background-mode',
+                        '--disable-hang-monitor',
+                        '--disable-prompt-on-repost',
+                        '--disable-client-side-phishing-detection',
+                        '--disable-component-update',
+                        '--disable-domain-reliability',
+                        '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    ]
                 )
                 
                 context = await browser.new_context(
-                    viewport={'width': 1024, 'height': 768},  # Giảm resolution hơn nữa
-                    user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+                    viewport={'width': 1024, 'height': 600},  # Giảm thêm resolution
+                    user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    extra_http_headers={
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
+                        'Accept-Encoding': 'gzip, deflate',
+                        'Connection': 'keep-alive',
+                        'Cache-Control': 'max-age=0'
+                    },
                     ignore_https_errors=True,
                     java_script_enabled=True,
                     bypass_csp=True
                 )
                 
-                # Giảm timeout để phù hợp Railway free tier
+                # Giảm timeout cho Railway trial
                 context.set_default_timeout(60000)  # 1 phút
                 
-                # Chặn tài nguyên tích cực hơn
+                # Chặn tài nguyên không cần thiết - quan trọng cho Railway trial
                 async def handle_route(route):
                     try:
                         resource_type = route.request.resource_type
                         url = route.request.url
                         
-                        # Chặn tất cả trừ document và script
-                        if resource_type in ["image", "media", "font", "stylesheet", "websocket", "other"]:
+                        # Chặn tất cả tài nguyên không cần thiết
+                        if resource_type in ["image", "media", "font", "stylesheet", "websocket", "eventsource"]:
                             await route.abort()
-                        # Chặn domain quảng cáo
+                        # Chặn các domain tracking/ads
                         elif any(domain in url for domain in [
-                            'google-analytics.com', 'googletagmanager.com', 'facebook.com',
-                            'doubleclick.net', 'googlesyndication.com', 'amazon-adsystem.com',
-                            'twitter.com', 'linkedin.com', 'instagram.com'
+                            'analytics', 'tracking', 'ads', 'facebook', 'google-analytics',
+                            'googletagmanager', 'doubleclick', 'googlesyndication',
+                            'amazon-adsystem', 'twitter', 'linkedin', 'pinterest'
                         ]):
                             await route.abort()
                         else:
                             await route.continue_()
                     except Exception:
                         try:
-                            await route.abort()
+                            await route.continue_()
                         except:
                             pass
 
@@ -581,49 +600,45 @@ async def inject_captcha_response(page, captcha_code):
                 page = await context.new_page()
                 page.set_default_timeout(60000)  # 1 phút
                 
-                # Tắt console logging để tiết kiệm tài nguyên
-                page.on("pageerror", lambda error: None)
-                page.on("console", lambda msg: None)
+                # Minimal error handlers
+                def handle_page_error_sync(error):
+                    if "net::ERR_" not in str(error):
+                        logger.error(f"Page error: {error}")
+
+                def handle_console_sync(msg):
+                    if msg.type == "error" and "net::ERR_" not in msg.text:
+                        logger.info(f"Console: {msg.text}")
+
+                page.on("pageerror", handle_page_error_sync)
+                page.on("console", handle_console_sync)
                 
                 # Thử từng loại đăng ký
                 for reg_type, reg_name in registration_types:
-                    logger.info(f"Trying registration type: {reg_name} ({reg_type})")
+                    logger.info(f"Trying: {reg_name}")
                     
                     try:
-                        # Step 1: Navigate nhanh hơn
-                        logger.info(f"Navigating to target URL for MST: {mst}")
+                        # Step 1: Navigate nhanh
+                        logger.info(f"Navigating for MST: {mst}")
+                        
+                        response = await page.goto(
+                            TARGET_URL, 
+                            timeout=60000,  # 1 phút
+                            wait_until='domcontentloaded'
+                        )
+                        
+                        if response and response.status >= 400:
+                            raise Exception(f"HTTP {response.status}")
+                        
+                        logger.info(f"Navigation OK: {response.status if response else 'Unknown'}")
+                        
+                        # Đợi ngắn hơn
+                        await page.wait_for_timeout(3000)  # 3 giây
+                        
+                        # Step 2: Wait for form - timeout ngắn
+                        logger.info("Waiting for form...")
                         
                         try:
-                            response = await asyncio.wait_for(
-                                page.goto(
-                                    TARGET_URL, 
-                                    wait_until='domcontentloaded',
-                                    timeout=30000
-                                ),
-                                timeout=40  # Timeout tổng 40 giây
-                            )
-                            
-                            if response and response.status >= 400:
-                                raise Exception(f"HTTP {response.status}")
-                            
-                            logger.info("Successfully navigated to target URL")
-                            await page.wait_for_timeout(3000)  # Giảm xuống 3 giây
-                            
-                        except asyncio.TimeoutError:
-                            logger.error("Navigation timeout")
-                            continue
-                        except Exception as nav_error:
-                            logger.error(f"Navigation failed: {nav_error}")
-                            continue
-                        
-                        # Step 2: Wait for form elements với timeout ngắn
-                        logger.info("Waiting for form elements...")
-                        
-                        try:
-                            await page.wait_for_selector(
-                                'select[id*="ANNOUNCEMENT_TYPE"]', 
-                                timeout=20000
-                            )
+                            await page.wait_for_selector('select[id*="ANNOUNCEMENT_TYPE"]', timeout=30000)
                             
                             # Kiểm tra form ready
                             form_ready = await page.evaluate("""
@@ -635,58 +650,41 @@ async def inject_captcha_response(page, captcha_code):
                             """)
                             
                             if not form_ready:
-                                logger.warning("Form not ready")
-                                continue
+                                await page.wait_for_timeout(3000)
                                 
-                        except Exception:
-                            logger.warning("Form elements not found")
+                        except Exception as form_error:
+                            logger.error(f"Form wait failed: {form_error}")
                             continue
                         
                         # Step 3: Fill form nhanh
-                        logger.info("Filling form...")
+                        logger.info(f"Filling form: {reg_name}")
                         
                         try:
+                            # Fill select
+                            await page.wait_for_selector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', timeout=20000)
                             await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', reg_type)
                             await page.wait_for_timeout(1000)
+                            
+                            # Fill input
+                            await page.wait_for_selector('#ctl00_C_ENT_GDT_CODEFld', timeout=20000)
                             await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
                             await page.wait_for_timeout(1000)
                             
-                            # Verify nhanh
-                            form_values = await page.evaluate("""
-                                () => {
-                                    const select = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
-                                    const input = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
-                                    return {
-                                        selectValue: select ? select.value : null,
-                                        inputValue: input ? input.value : null
-                                    };
-                                }
-                            """)
+                            logger.info("Form filled")
                             
-                            if form_values['selectValue'] != reg_type or form_values['inputValue'] != mst:
-                                logger.warning("Form fill failed")
-                                continue
-                                
                         except Exception as fill_error:
-                            logger.error(f"Form filling failed: {fill_error}")
+                            logger.error(f"Form fill failed: {fill_error}")
                             continue
                         
-                        # Step 4: Solve captcha với timeout ngắn
+                        # Step 4: Solve captcha nhanh
                         logger.info("Solving captcha...")
                         
                         try:
                             captcha_code = await asyncio.wait_for(
                                 asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL),
-                                timeout=45.0  # 45 giây timeout
+                                timeout=45.0  # 45 giây
                             )
-                            
-                            if not captcha_code:
-                                logger.error("Captcha solving failed")
-                                continue
-                                
-                        except asyncio.TimeoutError:
-                            logger.error("Captcha timeout")
-                            continue
+                            logger.info("Captcha solved")
                         except Exception as captcha_error:
                             logger.error(f"Captcha failed: {captcha_error}")
                             continue
@@ -701,35 +699,28 @@ async def inject_captcha_response(page, captcha_code):
                         
                         # Step 6: Submit form
                         try:
+                            logger.info("Submitting...")
                             await page.click('#ctl00_C_BtnFilter', force=True, timeout=20000)
                             await page.wait_for_timeout(3000)
                             
                         except Exception:
                             try:
-                                await page.evaluate("""
-                                    () => {
-                                        const btn = document.getElementById('ctl00_C_BtnFilter');
-                                        if (btn) btn.click();
-                                    }
-                                """)
+                                await page.evaluate("document.getElementById('ctl00_C_BtnFilter').click()")
                                 await page.wait_for_timeout(3000)
-                            except:
-                                logger.error("Form submission failed")
+                            except Exception as submit_error:
+                                logger.error(f"Submit failed: {submit_error}")
                                 continue
                         
                         # Step 7: Wait for results
-                        logger.info("Waiting for results...")
+                        logger.info("Checking results...")
                         
                         try:
-                            await page.wait_for_selector(
-                                '#ctl00_C_CtlList, text=Không tìm thấy dữ liệu', 
-                                timeout=30000
-                            )
+                            await page.wait_for_selector('#ctl00_C_CtlList, text=Không tìm thấy dữ liệu', timeout=30000)
                         except:
                             logger.warning("Results timeout")
-                            await page.wait_for_timeout(3000)
+                            await page.wait_for_timeout(2000)
                         
-                        # Kiểm tra kết quả
+                        # Kiểm tra có kết quả không
                         try:
                             await page.wait_for_selector('#ctl00_C_CtlList', timeout=10000)
                             logger.info("Results found")
@@ -738,7 +729,7 @@ async def inject_captcha_response(page, captcha_code):
                             continue
                         
                         # Step 8: Find PDF button
-                        logger.info("Looking for PDF download button...")
+                        logger.info("Finding PDF button...")
                         
                         pdf_selectors = [
                             'input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]',
@@ -751,40 +742,41 @@ async def inject_captcha_response(page, captcha_code):
                             try:
                                 pdf_button = await page.query_selector(selector)
                                 if pdf_button:
+                                    logger.info(f"Found PDF button: {selector}")
                                     break
                             except:
                                 continue
                         
                         if not pdf_button:
-                            logger.info(f"No PDF button for {reg_name}")
+                            logger.info(f"No PDF for {reg_name}")
                             continue
                         
                         # Step 9: Download PDF
-                        logger.info("Downloading PDF...")
+                        logger.info(f"Downloading PDF: {reg_name}")
                         
                         file_name = f"{mst}_{reg_type}_{uuid.uuid4().hex[:8]}.pdf"
                         download_path = os.path.join(os.getcwd(), file_name)
                         
                         try:
-                            async with page.expect_download(timeout=60000) as download_info:
+                            async with page.expect_download(timeout=90000) as download_info:  # 1.5 phút
                                 await pdf_button.click()
                             
                             download = await download_info.value
                             await download.save_as(download_path)
                             
                             if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
-                                logger.info(f"PDF downloaded: {file_name}")
+                                logger.info(f"PDF downloaded: {file_name} ({os.path.getsize(download_path)} bytes)")
                                 return file_name
                             else:
                                 logger.error("Empty PDF file")
                                 continue
-                                
+                            
                         except Exception as download_error:
                             logger.error(f"Download failed: {download_error}")
                             continue
                     
                     except Exception as reg_error:
-                        logger.error(f"Registration type {reg_name} failed: {reg_error}")
+                        logger.error(f"Registration {reg_name} failed: {reg_error}")
                         continue
                 
                 return None
@@ -794,9 +786,9 @@ async def inject_captcha_response(page, captcha_code):
             if attempt == max_retries - 1:
                 raise Exception(f"All attempts failed: {e}")
             
-            # Shorter wait time
-            wait_time = min(2 ** attempt, 10)
-            logger.info(f"Retrying in {wait_time}s...")
+            # Ngắn hơn giữa các lần thử
+            wait_time = min(2 ** attempt, 10)  # Max 10 giây
+            logger.info(f"Retry in {wait_time}s...")
             await asyncio.sleep(wait_time)
             
         finally:
