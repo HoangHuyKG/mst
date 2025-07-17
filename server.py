@@ -866,6 +866,44 @@ async def get_contact_info_internal(mst: str, max_retries: int = 3):
 
 port = int(os.environ.get("PORT", 8000))
 
+@app.get("/get-contact-info")
+async def get_contact_info_api(mst: str = Query(..., min_length=10, max_length=14)):
+    """API endpoint để lấy thông tin liên hệ (email và điện thoại)"""
+    try:
+        # Check balance
+        balance = await asyncio.to_thread(solver.get_balance)
+        if balance < 0.001:
+            return JSONResponse({"error": "Insufficient balance"}, status_code=400)
+        
+        # Crawl and download
+        pdf_path = await crawl_and_download_pdf(mst)
+        
+        if not pdf_path or not os.path.exists(pdf_path):
+            return JSONResponse({"error": "No results found"}, status_code=404)
+        
+        # Extract contact information from PDF
+        contact_info = extract_pdf_contact_info(pdf_path)
+        
+        if not contact_info:
+            return JSONResponse({"error": "No contact information found in PDF"}, status_code=404)
+        
+        # Clean up PDF file
+        try:
+            os.remove(pdf_path)
+            logger.info(f"Cleaned up PDF file: {pdf_path}")
+        except:
+            pass
+        
+        return JSONResponse({
+            "mst": mst,
+            "email": contact_info.get('email'),
+            "phone": contact_info.get('phone'),
+            "status": "success"
+        })
+        
+    except Exception as e:
+        logger.error(f"API error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/combined-info")
 async def get_combined_info_api(keyword: str = Query(..., min_length=1, description="Keyword to search for tax information")):
