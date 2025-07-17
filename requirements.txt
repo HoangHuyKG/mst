@@ -7,3 +7,10 @@ pyodbc
 python-dotenv
 supabase
 psycopg2-binary
+asyncio
+logging
+os
+uuid
+gc
+psutil
+time
