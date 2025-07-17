@@ -533,495 +533,372 @@ async def inject_captcha_response(page, captcha_code):
         logger.error(f"Injection failed: {e}")
         return False
 
-import asyncio
-import os
-import uuid
-import logging
-from playwright.async_api import async_playwright
-import gc
-import psutil
-import time
-
-logger = logging.getLogger(__name__)
-
-async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
-    """
-    Optimized crawl function for low-resource servers
-    - Reduced memory usage
-    - Better error handling
-    - Resource monitoring
-    - Faster timeouts
-    """
+async def crawl_and_download_pdf(mst: str, max_retries: int = 3):
+    """Fixed crawl function with correct Playwright syntax"""
     browser = None
-    context = None
-    page = None
     
-    # Registration types to try
+    # Danh sách các loại đăng ký để thử theo thứ tự
     registration_types = [
         ('NEW', 'Đăng ký mới'),
         ('AMEND', 'Đăng ký thay đổi')
     ]
     
-    # Memory monitoring function
-    def check_memory_usage():
-        try:
-            process = psutil.Process()
-            memory_info = process.memory_info()
-            memory_mb = memory_info.rss / 1024 / 1024
-            logger.info(f"Current memory usage: {memory_mb:.1f} MB")
-            return memory_mb
-        except:
-            return 0
-    
-    # Resource cleanup function
-    async def cleanup_resources():
-        nonlocal page, context, browser
-        try:
-            if page:
-                await page.close()
-                page = None
-            if context:
-                await context.close()
-                context = None
-            if browser:
-                await browser.close()
-                browser = None
-        except Exception as e:
-            logger.warning(f"Cleanup warning: {e}")
-        
-        # Force garbage collection
-        gc.collect()
-        await asyncio.sleep(1)
-    
     for attempt in range(max_retries):
         try:
             logger.info(f"Attempt {attempt + 1}/{max_retries} for MST: {mst}")
-            check_memory_usage()
-            
-            # Ensure clean state
-            await cleanup_resources()
             
             async with async_playwright() as p:
-                # Ultra-minimal browser configuration
+                # Cấu hình browser
                 browser = await p.chromium.launch(
-                    headless=True,
+                    headless=True,  # Để debug, đổi thành True khi deploy
                     args=[
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-dev-shm-usage',
+                        '--disable-blink-features=AutomationControlled',
                         '--disable-web-security',
-                        '--disable-features=TranslateUI',
-                        '--disable-ipc-flooding-protection',
-                        '--disable-renderer-backgrounding',
-                        '--disable-backgrounding-occluded-windows',
-                        '--disable-background-timer-throttling',
                         '--disable-features=VizDisplayCompositor',
-                        '--disable-extensions',
-                        '--disable-plugins',
-                        '--disable-images',
-                        '--disable-javascript-harmony-shipping',
-                        '--disable-background-networking',
-                        '--no-first-run',
-                        '--no-default-browser-check',
-                        '--disable-default-apps',
-                        '--disable-sync',
-                        '--disable-translate',
-                        '--disable-gpu',
-                        '--disable-accelerated-2d-canvas',
-                        '--disable-accelerated-video-decode',
-                        '--single-process',
-                        '--memory-pressure-off',
-                        '--max_old_space_size=256',  # Giảm từ 512 xuống 256
-                        '--js-flags=--max-old-space-size=256'
-                    ]
+                        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    ],
+                     ignore_default_args=['--disable-extensions']  # Di chuyển vào đây
                 )
-
-                # Minimal context configuration
+                
                 context = await browser.new_context(
-                    viewport={'width': 600, 'height': 400},  # Giảm thêm kích thước
-                    user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-                    ignore_https_errors=True,
-                    java_script_enabled=True,  # Cần thiết cho form submit
-                    bypass_csp=True,
-                    accept_downloads=True
-                )
+                viewport={'width': 1366, 'height': 768},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                extra_http_headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                },
+                ignore_https_errors=True,
+                java_script_enabled=True,
+                bypass_csp=True
+            )
                 
-                # Set shorter timeouts for low-resource server
-                context.set_default_timeout(60000)  # Giảm từ 180s xuống 60s
+                # Set timeout cho context sau khi tạo
+                context.set_default_timeout(180000)  # 3 phút
                 
-                # Aggressive resource blocking
+                # Chặn tài nguyên không cần thiết nhưng giữ lại CSS, JS và các tài nguyên quan trọng
                 await context.route("**/*", lambda route: (
-                    route.abort() if route.request.resource_type in [
-                        "image", "media", "font", "stylesheet", "manifest", "other"
-                    ] else route.continue_()
+                    route.abort() if route.request.resource_type in ["image", "media", "font"] 
+                    else route.continue_()
                 ))
                 
                 page = await context.new_page()
-                page.set_default_timeout(60000)
                 
-                # Simplified error handlers
-                page.on("pageerror", lambda error: logger.error(f"Page error: {str(error)[:100]}"))
-                page.on("console", lambda msg: None)  # Disable console logging
+                # Set timeout cho page
+                page.set_default_timeout(180000)  # 3 phút
                 
-                # Try each registration type
+                # Thêm error handlers
+                # Thêm error handlers với exception handling
+                async def handle_page_error(error):
+                    logger.error(f"Page error: {error}")
+
+                async def handle_console(msg):
+                    # Bỏ qua các lỗi network không quan trọng
+                    if msg.type == "error" and any(err in msg.text for err in ["net::ERR_FAILED", "net::ERR_ABORTED", "net::ERR_BLOCKED_BY_CLIENT"]):
+                        return
+                    if msg.type == "error":
+                        logger.info(f"Console: {msg.text}")
+
+                page.on("pageerror", handle_page_error)
+                page.on("console", handle_console)
+                # Xóa dòng duplicate này
+                # page.on("pageerror", lambda error: logger.error(f"Page error: {error}"))
+                # page.on("console", lambda msg: logger.info(f"Console: {msg.text}"))
+                
+                # Thử từng loại đăng ký
                 for reg_type, reg_name in registration_types:
-                    logger.info(f"Trying {reg_name} ({reg_type})")
+                    logger.info(f"Trying registration type: {reg_name} ({reg_type})")
                     
                     try:
-                        # Step 1: Navigate with multiple attempts and fallback
-                        logger.info("Navigating to target URL...")
+                        # Step 1: Navigate với retry logic
+                        logger.info(f"Navigating to target URL for MST: {mst}")
                         
-                        navigation_success = False
-                        for nav_attempt in range(3):  # 3 attempts for navigation
+                        for nav_attempt in range(3):
                             try:
-                                start_time = time.time()
+                                logger.info(f"Navigation attempt {nav_attempt + 1}/3")
                                 
-                                # Progressive timeout: 30s, 45s, 60s
-                                timeout_duration = 30000 + (nav_attempt * 15000)
-                                
-                                logger.info(f"Navigation attempt {nav_attempt + 1}/3 with {timeout_duration/1000}s timeout")
-                                
+                                # Thử truy cập trang
                                 response = await page.goto(
                                     TARGET_URL, 
-                                    timeout=timeout_duration,
-                                    wait_until='domcontentloaded'
+                                    timeout=180000, 
+                                    wait_until='networkidle'
                                 )
                                 
+                                # Kiểm tra response status
                                 if response and response.status >= 400:
-                                    logger.warning(f"HTTP {response.status}, trying again...")
-                                    raise Exception(f"HTTP {response.status}")
+                                    logger.error(f"HTTP error: {response.status}")
+                                    raise Exception(f"HTTP {response.status} error")
                                 
-                                # Test if page loaded properly
-                                try:
-                                    await page.wait_for_selector('body', timeout=5000)
-                                    navigation_success = True
-                                    logger.info(f"Navigation successful in {time.time() - start_time:.1f}s")
-                                    break
-                                except:
-                                    logger.warning("Page body not found, retrying...")
-                                    continue
-                                    
+                                logger.info(f"Successfully navigated to target URL. Status: {response.status if response else 'Unknown'}")
+                                
+                                # Đợi một chút để trang stable
+                                await page.wait_for_timeout(5000)
+                                break
+                                
                             except Exception as nav_error:
-                                logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {str(nav_error)[:50]}...")
-                                
-                                if nav_attempt < 2:  # Not the last attempt
-                                    await asyncio.sleep(2)
-                                    continue
-                                else:
+                                logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {nav_error}")
+                                if nav_attempt == 2:
                                     logger.error("All navigation attempts failed")
                                     raise nav_error
+                                await asyncio.sleep(3)
                         
-                        if not navigation_success:
-                            raise Exception("Failed to navigate to target URL")
+                        # Step 2: Wait for form elements
+                        logger.info("Waiting for form elements...")
                         
-                        # Minimal wait after successful navigation
-                        await page.wait_for_timeout(1000)
+                        # Thử multiple selectors
+                        selectors_to_try = [
+                            '#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld',
+                            'select[name*="ANNOUNCEMENT_TYPE"]',
+                            'select[id*="ANNOUNCEMENT_TYPE"]'
+                        ]
                         
-                        # Step 2: Quick form element check
-                        logger.info("Checking form elements...")
-                        
-                        try:
-                            await page.wait_for_selector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', timeout=15000)
-                        except:
-                            logger.warning("Primary form selector not found, trying alternatives...")
-                            # Quick check for alternatives
-                            selectors = [
-                                'select[name*="ANNOUNCEMENT_TYPE"]',
-                                'select[id*="ANNOUNCEMENT_TYPE"]'
-                            ]
-                            
-                            found = False
-                            for selector in selectors:
-                                try:
-                                    await page.wait_for_selector(selector, timeout=5000)
-                                    found = True
-                                    break
-                                except:
-                                    continue
-                            
-                            if not found:
-                                logger.error("No form elements found")
-                                if reg_type == registration_types[-1][0]:
-                                    return None
+                        form_found = False
+                        for selector in selectors_to_try:
+                            try:
+                                await page.wait_for_selector(selector, timeout=30000)
+                                logger.info(f"Found form element with selector: {selector}")
+                                form_found = True
+                                break
+                            except Exception as e:
+                                logger.warning(f"Selector {selector} not found: {e}")
                                 continue
                         
-                        # Step 3: Fill form quickly
-                        logger.info("Filling form...")
+                        if not form_found:
+                            # Debug: In ra HTML của trang
+                            page_content = await page.content()
+                            logger.error("Form not found. Page content preview:")
+                            logger.error(page_content[:1000] + "...")
+                            raise Exception("Form elements not found on page")
                         
-                        await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', reg_type)
-                        await page.wait_for_timeout(1000)  # Giảm từ 3s xuống 1s
-                        
-                        await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
-                        await page.wait_for_timeout(1000)  # Giảm từ 2s xuống 1s
-                        
-                        # Step 4: Solve captcha with improved handling
-                        logger.info("Solving captcha...")
+                        # Step 3: Fill form
+                        logger.info(f"Filling form with registration type: {reg_name}")
                         
                         try:
-                            captcha_code = await solve_captcha_with_retry(SITE_KEY, TARGET_URL)
-                        except Exception as e:
-                            logger.error(f"Captcha solving failed: {str(e)[:50]}...")
-                            if reg_type == registration_types[-1][0]:
-                                raise e
-                            continue
+                            # Thử fill form với exception handling
+                            await page.select_option('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld', reg_type)
+                            await page.wait_for_timeout(3000)
+                            
+                            await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
+                            await page.wait_for_timeout(2000)
+                            
+                            logger.info("Form filled successfully")
+                            
+                        except Exception as form_error:
+                            logger.error(f"Form filling failed: {form_error}")
+                            
+                            # Debug: Kiểm tra các elements có tồn tại không
+                            elements_info = await page.evaluate("""
+                                () => {
+                                    const info = {};
+                                    const typeSelect = document.querySelector('#ctl00_C_ANNOUNCEMENT_TYPE_IDFilterFld');
+                                    const codeInput = document.querySelector('#ctl00_C_ENT_GDT_CODEFld');
+                                    
+                                    info.typeSelectExists = !!typeSelect;
+                                    info.codeInputExists = !!codeInput;
+                                    
+                                    if (typeSelect) {
+                                        info.typeSelectOptions = Array.from(typeSelect.options).map(opt => opt.value);
+                                    }
+                                    
+                                    return info;
+                                }
+                            """)
+                            
+                            logger.error(f"Form elements info: {elements_info}")
+                            raise form_error
+                        
+                        # Step 4: Solve captcha
+                        logger.info("Solving captcha...")
+                        captcha_code = None
+                        
+                        for captcha_attempt in range(2):
+                            try:
+                                captcha_code = await asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL)
+                                logger.info("Captcha solved successfully")
+                                break
+                            except Exception as captcha_error:
+                                logger.warning(f"Captcha attempt {captcha_attempt + 1} failed: {captcha_error}")
+                                if captcha_attempt == 1:
+                                    raise captcha_error
+                                await asyncio.sleep(5)
+                        
+                        if not captcha_code:
+                            raise Exception("Failed to solve captcha")
                         
                         # Step 5: Inject captcha
                         success = await inject_captcha_response(page, captcha_code)
                         if not success:
-                            logger.error("Captcha injection failed")
-                            if reg_type == registration_types[-1][0]:
-                                raise Exception("Captcha injection failed")
-                            continue
+                            raise Exception("Failed to inject captcha response")
                         
-                        await page.wait_for_timeout(1000)
+                        await page.wait_for_timeout(3000)
                         
                         # Step 6: Submit form
                         logger.info("Submitting form...")
                         
-                        await page.click('#ctl00_C_BtnFilter')
+                        try:
+                            await page.click('#ctl00_C_BtnFilter')
+                            logger.info("Form submitted successfully")
+                        except Exception as submit_error:
+                            logger.error(f"Form submission failed: {submit_error}")
+                            raise submit_error
                         
-                        # Step 7: Wait for results with better error handling
+                        # Step 7: Wait for results
                         logger.info("Waiting for results...")
                         
-                        results_found = False
+                        await page.wait_for_load_state('networkidle', timeout=120000)
+                        
+                        # Check for results table
                         try:
-                            # First wait for page to load
-                            await page.wait_for_load_state('domcontentloaded', timeout=20000)
-                            
-                            # Then wait for results table with multiple attempts
-                            for result_attempt in range(3):
-                                try:
-                                    await page.wait_for_selector('#ctl00_C_CtlList', timeout=10000)
-                                    results_found = True
-                                    logger.info("Results table found")
-                                    break
-                                except:
-                                    if result_attempt < 2:
-                                        logger.info(f"Results attempt {result_attempt + 1}/3 failed, retrying...")
-                                        await page.wait_for_timeout(2000)
-                                        continue
-                                    else:
-                                        logger.warning("Results table not found after 3 attempts")
-                                        break
-                            
-                        except Exception as load_error:
-                            logger.warning(f"Page load failed: {str(load_error)[:50]}...")
-                        
-                        if not results_found:
+                            await page.wait_for_selector('#ctl00_C_CtlList', timeout=45000)
+                            logger.info("Results table found")
+                        except Exception:
                             # Check for no results message
-                            no_results_selectors = [
-                                'text=Không tìm thấy dữ liệu',
-                                'text=No data found',
-                                '.no-results'
-                            ]
-                            
-                            found_no_results = False
-                            for selector in no_results_selectors:
-                                try:
-                                    await page.wait_for_selector(selector, timeout=3000)
-                                    found_no_results = True
-                                    logger.info(f"No results message found: {selector}")
-                                    break
-                                except:
-                                    continue
-                            
-                            if found_no_results:
-                                logger.info(f"No results for {reg_name}")
-                                if reg_type == registration_types[-1][0]:
-                                    return None
-                                continue
-                            else:
-                                logger.error("Could not determine page state")
-                                # Save screenshot for debugging
-                                try:
-                                    screenshot_path = f"debug_{mst}_{reg_type}_{attempt}.png"
-                                    await page.screenshot(path=screenshot_path)
-                                    logger.info(f"Debug screenshot saved: {screenshot_path}")
-                                except:
-                                    pass
+                            try:
+                                no_results_selectors = [
+                                    'text=Không tìm thấy dữ liệu',
+                                    'text=No data found',
+                                    '.no-results',
+                                    '[id*="NoData"]'
+                                ]
                                 
-                                if reg_type == registration_types[-1][0]:
-                                    raise Exception("Results determination failed")
+                                for selector in no_results_selectors:
+                                    try:
+                                        await page.wait_for_selector(selector, timeout=5000)
+                                        logger.info(f"No results found with selector: {selector} for {reg_name}")
+                                        break
+                                    except:
+                                        continue
+                                else:
+                                    logger.error("Results table not found within timeout")
+                                    
+                                    # Debug: Lấy thông tin trang sau khi submit
+                                    current_url = page.url
+                                    page_title = await page.title()
+                                    logger.error(f"Current URL: {current_url}")
+                                    logger.error(f"Page title: {page_title}")
+                                    
+                                    # Lưu screenshot để debug
+                                    try:
+                                        await page.screenshot(path=f"debug_{mst}_{reg_type}_{attempt}.png")
+                                        logger.info(f"Screenshot saved: debug_{mst}_{reg_type}_{attempt}.png")
+                                    except:
+                                        pass
+                                    
+                                    raise Exception("Results table not found")
+                                
+                                # Nếu không có kết quả, thử loại đăng ký tiếp theo
+                                logger.info(f"No results found for {reg_name}, trying next registration type...")
                                 continue
+                            except:
+                                pass
                         
-                        # Step 8: Find PDF button
-                        logger.info("Looking for PDF button...")
+                        # Step 8: Find and download PDF
+                        logger.info("Looking for PDF download button...")
                         
+                        # Thử multiple selectors cho PDF button
                         pdf_selectors = [
-                            'input[id*="LnkGetPDFActive"]',
-                            'input[type="image"][src*="pdf"]',
-                            'input[src*="pdf.png"]'
-                        ]
+                                'input[id*="LnkGetPDFActive"]',  # Selector chính xác nhất
+                                'input[type="image"][src*="pdf"]',  # Backup selector
+                                'input[name*="LnkGetPDFActive"]',  # Thêm selector dựa vào name
+                                'input[id^="ctl00_C_CtlList_"][id$="_LnkGetPDFActive"]',
+                                'input[src*="pdf.png"]'  # Dựa vào src image
+                            ]
                         
                         pdf_button = None
                         for selector in pdf_selectors:
                             try:
                                 pdf_button = await page.query_selector(selector)
                                 if pdf_button:
+                                    logger.info(f"Found PDF button with selector: {selector}")
                                     break
-                            except:
+                            except Exception as e:
+                                logger.warning(f"PDF selector {selector} failed: {e}")
                                 continue
                         
                         if not pdf_button:
-                            logger.info(f"No PDF button for {reg_name}")
+                            logger.info(f"No PDF button found for {reg_name}")
+                            # Nếu là loại đăng ký cuối cùng, return None
                             if reg_type == registration_types[-1][0]:
+                                logger.info("No PDF found in any registration type")
                                 return None
-                            continue
+                            else:
+                                # Thử loại đăng ký tiếp theo
+                                logger.info(f"Trying next registration type...")
+                                continue
                         
                         # Step 9: Download PDF
-                        logger.info("Downloading PDF...")
+                        logger.info(f"Downloading PDF for {reg_name}...")
                         
                         file_name = f"{mst}_{reg_type}_{uuid.uuid4().hex[:8]}.pdf"
                         download_path = os.path.join(os.getcwd(), file_name)
                         
                         try:
-                            async with page.expect_download(timeout=60000) as download_info:
+                            async with page.expect_download(timeout=120000) as download_info:
                                 await pdf_button.click()
+                                logger.info("Clicked PDF download button")
                             
                             download = await download_info.value
                             await download.save_as(download_path)
+                            logger.info(f"PDF downloaded successfully: {file_name}")
                             
-                            # Quick verification
-                            if os.path.exists(download_path) and os.path.getsize(download_path) > 1000:
-                                logger.info(f"PDF downloaded: {file_name} ({os.path.getsize(download_path)} bytes)")
+                            # Verify file exists and has content
+                            if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
+                                logger.info(f"PDF file verified: {os.path.getsize(download_path)} bytes")
+                                logger.info(f"Successfully downloaded PDF from {reg_name}")
                                 return file_name
                             else:
-                                logger.error("Downloaded file is invalid")
-                                if reg_type == registration_types[-1][0]:
+                                logger.error("Downloaded PDF file is empty or doesn't exist")
+                                # Nếu file rỗng, thử loại đăng ký tiếp theo
+                                if reg_type != registration_types[-1][0]:
+                                    logger.info("Empty PDF, trying next registration type...")
+                                    continue
+                                else:
                                     return None
+                            
+                        except Exception as download_error:
+                            logger.error(f"Download failed for {reg_name}: {download_error}")
+                            # Nếu download fail và không phải loại cuối cùng, thử loại tiếp theo
+                            if reg_type != registration_types[-1][0]:
+                                logger.info("Download failed, trying next registration type...")
                                 continue
-                                
-                        except Exception as e:
-                            logger.error(f"Download failed: {e}")
-                            if reg_type == registration_types[-1][0]:
-                                raise e
-                            continue
+                            else:
+                                raise Exception(f"PDF download failed for all registration types. Last error: {download_error}")
                     
-                    except Exception as e:
-                        logger.error(f"{reg_name} failed: {str(e)[:100]}")
-                        if reg_type == registration_types[-1][0]:
-                            raise e
-                        continue
+                    except Exception as reg_error:
+                        logger.error(f"Registration type {reg_name} failed: {reg_error}")
+                        # Nếu không phải loại cuối cùng, thử loại tiếp theo
+                        if reg_type != registration_types[-1][0]:
+                            logger.info("Current registration type failed, trying next...")
+                            continue
+                        else:
+                            # Nếu là loại cuối cùng, raise error
+                            raise reg_error
                 
+                # Nếu đã thử hết tất cả các loại đăng ký mà không thành công
+                logger.error("All registration types failed")
                 return None
                 
         except Exception as e:
-            logger.error(f"Attempt {attempt + 1} failed: {str(e)[:100]}")
-            
+            logger.error(f"Attempt {attempt + 1} failed: {e}")
             if attempt == max_retries - 1:
-                raise Exception(f"All attempts failed: {str(e)[:100]}")
+                raise Exception(f"All {max_retries} attempts failed. Last error: {e}")
             
-            # Exponential backoff with jitter và cleanup
-            wait_time = min(2 ** attempt + (attempt * 0.5), 8)  # Giảm max wait từ 10s xuống 8s
-            logger.info(f"Waiting {wait_time:.1f}s before retry...")
-            
-            # Cleanup trước khi retry
-            await cleanup_resources()
+            # Wait before retry
+            wait_time = 2 ** attempt
+            logger.info(f"Waiting {wait_time} seconds before retry...")
             await asyncio.sleep(wait_time)
             
         finally:
-            # Ensure cleanup
-            await cleanup_resources()
-            check_memory_usage()
-    
-    return None
-
-
-# Additional helper function for memory monitoring
-async def monitor_system_resources():
-    """Monitor system resources and log warnings"""
-    try:
-        process = psutil.Process()
-        memory_info = process.memory_info()
-        memory_mb = memory_info.rss / 1024 / 1024
-        
-        # Get system memory
-        system_memory = psutil.virtual_memory()
-        system_memory_mb = system_memory.total / 1024 / 1024
-        memory_percent = (memory_mb / system_memory_mb) * 100
-        
-        logger.info(f"Process memory: {memory_mb:.1f}MB ({memory_percent:.1f}% of system)")
-        
-        # Warning thresholds
-        if memory_mb > 400:  # Giảm từ 500MB xuống 400MB
-            logger.warning("High memory usage detected")
-        if memory_percent > 40:  # Giảm từ 50% xuống 40%
-            logger.warning("Process using >40% of system memory")
-            
-    except Exception as e:
-        logger.warning(f"Resource monitoring failed: {e}")
-
-
-# Network connectivity test
-async def test_network_connectivity(url: str, timeout: int = 10):
-    """Test network connectivity to target URL"""
-    try:
-        import aiohttp
-        
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            async with session.get(url) as response:
-                logger.info(f"Network test: {url} returned {response.status}")
-                return response.status < 400
-    except Exception as e:
-        logger.error(f"Network test failed: {e}")
-        return False
-
-
-# Captcha solver with better error handling
-async def solve_captcha_with_retry(site_key: str, url: str, max_attempts: int = 2):
-    """Solve captcha with retry mechanism"""
-    for attempt in range(max_attempts):
-        try:
-            logger.info(f"Captcha solving attempt {attempt + 1}/{max_attempts}")
-            
-            # Test network first
-            if not await test_network_connectivity("https://2captcha.com", 5):
-                logger.warning("2captcha.com not reachable")
-                if attempt == max_attempts - 1:
-                    raise Exception("2captcha service unreachable")
-                continue
-            
-            # Solve with timeout
-            captcha_task = asyncio.create_task(
-                asyncio.to_thread(solver.solve_recaptcha, site_key, url)
-            )
-            
-            result = await asyncio.wait_for(captcha_task, timeout=60.0)  # 60s timeout
-            logger.info("Captcha solved successfully")
-            return result
-            
-        except asyncio.TimeoutError:
-            logger.error(f"Captcha attempt {attempt + 1} timeout")
-            if captcha_task and not captcha_task.done():
-                captcha_task.cancel()
+            if browser:
                 try:
-                    await captcha_task
-                except asyncio.CancelledError:
+                    await browser.close()
+                except:
                     pass
-            
-            if attempt == max_attempts - 1:
-                raise Exception("Captcha solving timeout")
-            
-            await asyncio.sleep(5)  # Wait before retry
-            
-        except Exception as e:
-            logger.error(f"Captcha attempt {attempt + 1} failed: {e}")
-            if attempt == max_attempts - 1:
-                raise e
-            await asyncio.sleep(3)
-    
-    raise Exception("All captcha attempts failed")
-
-
-# Memory cleanup utility
-async def force_cleanup():
-    """Force cleanup and garbage collection"""
-    try:
-        gc.collect()
-        await asyncio.sleep(0.1)
-        logger.info("Forced cleanup completed")
-    except Exception as e:
-        logger.warning(f"Forced cleanup failed: {e}")
 
 
 @app.get("/tax-info")
