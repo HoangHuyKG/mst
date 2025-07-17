@@ -8,3 +8,4 @@ python-dotenv
 supabase
 psutil
 psycopg2-binary
+aiohttp

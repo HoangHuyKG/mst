@@ -564,11 +564,14 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
     
     # Memory monitoring function
     def check_memory_usage():
-        process = psutil.Process()
-        memory_info = process.memory_info()
-        memory_mb = memory_info.rss / 1024 / 1024
-        logger.info(f"Current memory usage: {memory_mb:.1f} MB")
-        return memory_mb
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+            logger.info(f"Current memory usage: {memory_mb:.1f} MB")
+            return memory_mb
+        except:
+            return 0
     
     # Resource cleanup function
     async def cleanup_resources():
@@ -665,22 +668,54 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                     logger.info(f"Trying {reg_name} ({reg_type})")
                     
                     try:
-                        # Step 1: Navigate with shorter timeout
+                        # Step 1: Navigate with multiple attempts and fallback
                         logger.info("Navigating to target URL...")
                         
-                        start_time = time.time()
-                        response = await page.goto(
-                            TARGET_URL, 
-                            timeout=45000,  # Giảm từ 180s xuống 45s
-                            wait_until='domcontentloaded'  # Thay vì networkidle
-                        )
+                        navigation_success = False
+                        for nav_attempt in range(3):  # 3 attempts for navigation
+                            try:
+                                start_time = time.time()
+                                
+                                # Progressive timeout: 30s, 45s, 60s
+                                timeout_duration = 30000 + (nav_attempt * 15000)
+                                
+                                logger.info(f"Navigation attempt {nav_attempt + 1}/3 with {timeout_duration/1000}s timeout")
+                                
+                                response = await page.goto(
+                                    TARGET_URL, 
+                                    timeout=timeout_duration,
+                                    wait_until='domcontentloaded'
+                                )
+                                
+                                if response and response.status >= 400:
+                                    logger.warning(f"HTTP {response.status}, trying again...")
+                                    raise Exception(f"HTTP {response.status}")
+                                
+                                # Test if page loaded properly
+                                try:
+                                    await page.wait_for_selector('body', timeout=5000)
+                                    navigation_success = True
+                                    logger.info(f"Navigation successful in {time.time() - start_time:.1f}s")
+                                    break
+                                except:
+                                    logger.warning("Page body not found, retrying...")
+                                    continue
+                                    
+                            except Exception as nav_error:
+                                logger.warning(f"Navigation attempt {nav_attempt + 1} failed: {str(nav_error)[:50]}...")
+                                
+                                if nav_attempt < 2:  # Not the last attempt
+                                    await asyncio.sleep(2)
+                                    continue
+                                else:
+                                    logger.error("All navigation attempts failed")
+                                    raise nav_error
                         
-                        if response and response.status >= 400:
-                            raise Exception(f"HTTP {response.status}")
+                        if not navigation_success:
+                            raise Exception("Failed to navigate to target URL")
                         
-                        # Minimal wait
-                        await page.wait_for_timeout(2000)
-                        logger.info(f"Navigation took {time.time() - start_time:.1f}s")
+                        # Minimal wait after successful navigation
+                        await page.wait_for_timeout(1000)
                         
                         # Step 2: Quick form element check
                         logger.info("Checking form elements...")
@@ -719,23 +754,13 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                         await page.fill('#ctl00_C_ENT_GDT_CODEFld', mst)
                         await page.wait_for_timeout(1000)  # Giảm từ 2s xuống 1s
                         
-                        # Step 4: Solve captcha with timeout
+                        # Step 4: Solve captcha with improved handling
                         logger.info("Solving captcha...")
                         
                         try:
-                            # Timeout for captcha solving
-                            captcha_task = asyncio.create_task(
-                                asyncio.to_thread(solver.solve_recaptcha, SITE_KEY, TARGET_URL)
-                            )
-                            captcha_code = await asyncio.wait_for(captcha_task, timeout=30.0)
-                            
-                        except asyncio.TimeoutError:
-                            logger.error("Captcha solving timeout")
-                            if reg_type == registration_types[-1][0]:
-                                raise Exception("Captcha timeout")
-                            continue
+                            captcha_code = await solve_captcha_with_retry(SITE_KEY, TARGET_URL)
                         except Exception as e:
-                            logger.error(f"Captcha failed: {e}")
+                            logger.error(f"Captcha solving failed: {str(e)[:50]}...")
                             if reg_type == registration_types[-1][0]:
                                 raise e
                             continue
@@ -755,19 +780,39 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                         
                         await page.click('#ctl00_C_BtnFilter')
                         
-                        # Step 7: Wait for results with shorter timeout
+                        # Step 7: Wait for results with better error handling
                         logger.info("Waiting for results...")
                         
+                        results_found = False
                         try:
-                            await page.wait_for_load_state('domcontentloaded', timeout=30000)
-                            await page.wait_for_selector('#ctl00_C_CtlList', timeout=20000)
-                            logger.info("Results found")
+                            # First wait for page to load
+                            await page.wait_for_load_state('domcontentloaded', timeout=20000)
                             
-                        except:
-                            # Quick check for no results
+                            # Then wait for results table with multiple attempts
+                            for result_attempt in range(3):
+                                try:
+                                    await page.wait_for_selector('#ctl00_C_CtlList', timeout=10000)
+                                    results_found = True
+                                    logger.info("Results table found")
+                                    break
+                                except:
+                                    if result_attempt < 2:
+                                        logger.info(f"Results attempt {result_attempt + 1}/3 failed, retrying...")
+                                        await page.wait_for_timeout(2000)
+                                        continue
+                                    else:
+                                        logger.warning("Results table not found after 3 attempts")
+                                        break
+                            
+                        except Exception as load_error:
+                            logger.warning(f"Page load failed: {str(load_error)[:50]}...")
+                        
+                        if not results_found:
+                            # Check for no results message
                             no_results_selectors = [
                                 'text=Không tìm thấy dữ liệu',
-                                'text=No data found'
+                                'text=No data found',
+                                '.no-results'
                             ]
                             
                             found_no_results = False
@@ -775,6 +820,7 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                                 try:
                                     await page.wait_for_selector(selector, timeout=3000)
                                     found_no_results = True
+                                    logger.info(f"No results message found: {selector}")
                                     break
                                 except:
                                     continue
@@ -785,9 +831,17 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
                                     return None
                                 continue
                             else:
-                                logger.error("Results timeout")
+                                logger.error("Could not determine page state")
+                                # Save screenshot for debugging
+                                try:
+                                    screenshot_path = f"debug_{mst}_{reg_type}_{attempt}.png"
+                                    await page.screenshot(path=screenshot_path)
+                                    logger.info(f"Debug screenshot saved: {screenshot_path}")
+                                except:
+                                    pass
+                                
                                 if reg_type == registration_types[-1][0]:
-                                    raise Exception("Results timeout")
+                                    raise Exception("Results determination failed")
                                 continue
                         
                         # Step 8: Find PDF button
@@ -857,9 +911,12 @@ async def crawl_and_download_pdf(mst: str, max_retries: int = 2):
             if attempt == max_retries - 1:
                 raise Exception(f"All attempts failed: {str(e)[:100]}")
             
-            # Exponential backoff with jitter
-            wait_time = min(2 ** attempt + (attempt * 0.5), 10)
+            # Exponential backoff with jitter và cleanup
+            wait_time = min(2 ** attempt + (attempt * 0.5), 8)  # Giảm max wait từ 10s xuống 8s
             logger.info(f"Waiting {wait_time:.1f}s before retry...")
+            
+            # Cleanup trước khi retry
+            await cleanup_resources()
             await asyncio.sleep(wait_time)
             
         finally:
@@ -886,13 +943,74 @@ async def monitor_system_resources():
         logger.info(f"Process memory: {memory_mb:.1f}MB ({memory_percent:.1f}% of system)")
         
         # Warning thresholds
-        if memory_mb > 500:
+        if memory_mb > 400:  # Giảm từ 500MB xuống 400MB
             logger.warning("High memory usage detected")
-        if memory_percent > 50:
-            logger.warning("Process using >50% of system memory")
+        if memory_percent > 40:  # Giảm từ 50% xuống 40%
+            logger.warning("Process using >40% of system memory")
             
     except Exception as e:
         logger.warning(f"Resource monitoring failed: {e}")
+
+
+# Network connectivity test
+async def test_network_connectivity(url: str, timeout: int = 10):
+    """Test network connectivity to target URL"""
+    try:
+        import aiohttp
+        
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.get(url) as response:
+                logger.info(f"Network test: {url} returned {response.status}")
+                return response.status < 400
+    except Exception as e:
+        logger.error(f"Network test failed: {e}")
+        return False
+
+
+# Captcha solver with better error handling
+async def solve_captcha_with_retry(site_key: str, url: str, max_attempts: int = 2):
+    """Solve captcha with retry mechanism"""
+    for attempt in range(max_attempts):
+        try:
+            logger.info(f"Captcha solving attempt {attempt + 1}/{max_attempts}")
+            
+            # Test network first
+            if not await test_network_connectivity("https://2captcha.com", 5):
+                logger.warning("2captcha.com not reachable")
+                if attempt == max_attempts - 1:
+                    raise Exception("2captcha service unreachable")
+                continue
+            
+            # Solve with timeout
+            captcha_task = asyncio.create_task(
+                asyncio.to_thread(solver.solve_recaptcha, site_key, url)
+            )
+            
+            result = await asyncio.wait_for(captcha_task, timeout=60.0)  # 60s timeout
+            logger.info("Captcha solved successfully")
+            return result
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Captcha attempt {attempt + 1} timeout")
+            if captcha_task and not captcha_task.done():
+                captcha_task.cancel()
+                try:
+                    await captcha_task
+                except asyncio.CancelledError:
+                    pass
+            
+            if attempt == max_attempts - 1:
+                raise Exception("Captcha solving timeout")
+            
+            await asyncio.sleep(5)  # Wait before retry
+            
+        except Exception as e:
+            logger.error(f"Captcha attempt {attempt + 1} failed: {e}")
+            if attempt == max_attempts - 1:
+                raise e
+            await asyncio.sleep(3)
+    
+    raise Exception("All captcha attempts failed")
 
 
 # Memory cleanup utility
