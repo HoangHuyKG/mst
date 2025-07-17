@@ -827,7 +827,7 @@ async def get_contact_info_internal(mst: str, max_retries: int = 3):
                 return None
             
             # Crawl and download with retry
-            pdf_path = await crawl_and_download_pdf(mst, max_retries=2)
+            pdf_path = await crawl_and_download_pdf(mst)
             
             if not pdf_path or not os.path.exists(pdf_path):
                 logger.info("No PDF found for MST")
